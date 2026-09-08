@@ -273,6 +273,7 @@ impl DeploymentConfig {
         clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
     ) -> RunnerResult<(ClientRouter, Option<CallerAuthKind>)> {
         let mut by_model = HashMap::new();
+        let mut target_names = HashMap::new();
         let mut caller_auth = None;
         for name in route.callable_target_names() {
             let target = self.targets.get(name).ok_or_else(|| {
@@ -298,8 +299,12 @@ impl DeploymentConfig {
             }
             let client: Arc<dyn RoutedLlmClient> = client.clone();
             by_model.insert(target.id.clone(), client);
+            target_names.insert(target.id.clone(), name.to_string());
         }
-        Ok((ClientRouter::new(by_model), caller_auth))
+        Ok((
+            ClientRouter::new(by_model).with_target_names(target_names),
+            caller_auth,
+        ))
     }
 
     fn fallback_base_url(&self) -> RunnerResult<Option<String>> {

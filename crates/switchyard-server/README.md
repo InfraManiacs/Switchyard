@@ -222,4 +222,66 @@ since the duration describes the router rather than the target it chose; a routi
 an outcome records nothing. Its buckets start at 0.1 ms via a view in the server; the SDK defaults
 start at 5 ms.
 
+## Tracing
+
+The server exports OpenTelemetry traces over OTLP when the standard SDK variables select an
+endpoint (`OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, with
+`OTEL_SERVICE_NAME` naming the service and `OTEL_SDK_DISABLED` turning everything off). Inbound
+W3C `traceparent`/`tracestate` headers are continued, so a request joins the caller's trace.
+
+Each request opens a `switchyard.request` span, and every real model call — the terminal answer
+call and any classifier, judge, or fallback call an algorithm makes — opens a child span named
+`{gen_ai.operation.name} {gen_ai.request.model}`, for example `chat anthropic/claude-opus-4-5`.
+That span follows the OpenTelemetry GenAI semantic conventions:
+
+| Attribute | Meaning |
+|---|---|
+| `gen_ai.operation.name` | Always `chat` |
+| `gen_ai.provider.name` | Provider identified from the target's configured base URL, falling back to the provider its wire format implies |
+| `gen_ai.request.model` | Upstream model id of the target that was called |
+| `gen_ai.response.model` | Model the provider echoed back |
+| `gen_ai.request.temperature`, `.top_p`, `.top_k`, `.max_tokens`, `.reasoning.level`, `.stream` | Sampling and output controls, when the request set them |
+| `gen_ai.usage.input_tokens`, `.output_tokens` | Prompt and completion tokens |
+| `gen_ai.usage.cache_read.input_tokens`, `.cache_creation.input_tokens`, `.reasoning.output_tokens` | Cache and reasoning token detail, when the provider reports it |
+| `gen_ai.response.id`, `gen_ai.response.finish_reasons`, `gen_ai.output.type` | Response identity, stop reasons, and output shape |
+| `gen_ai.conversation.id` | Session id from the request's correlation metadata |
+| `server.address`, `server.port` | Upstream host actually called |
+
+Alongside them, the same span carries Switchyard's own routing attributes, which are what tie a
+recorded generation back to the decision that produced it:
+
+| Attribute | Meaning |
+|---|---|
+| `switchyard.route` | Route the caller addressed, before a target replaced it |
+| `switchyard.algorithm` | Routing algorithm that made the decision |
+| `switchyard.target.name` | Configured target name (`capable`, `efficient`, ...) serving the call |
+| `switchyard.candidate`, `switchyard.candidate_count` | Position of this candidate in the ordered fallback list |
+| `switchyard.routing_overhead_ms` | Time routing took, on the terminal call only — a routing-time call happens before it is known |
+
+### Capturing prompt and completion content
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | unset (off) | Set to `true` or `1` to add `gen_ai.input.messages`, `gen_ai.output.messages`, and `gen_ai.system_instructions` to every model-call span |
+
+**This is off by default on purpose, and turning it on is a data-handling decision.** With it
+enabled, every exported span carries the full content of the call: prompts, system instructions,
+completions, tool arguments, and tool results. That content routinely includes end-user personal
+data, proprietary business material, and text whose licence does not permit reuse. Enable it only
+when the trace backend's access control and retention are appropriate for that content. The
+variable is read once at startup, and content is written only to exported spans — never to the
+server's own logs.
+
+The attributes hold JSON strings, because OpenTelemetry attributes have no nested form.
+`gen_ai.input.messages` and `gen_ai.output.messages` are `[{"role": ..., "parts": [...]}]`
+(output messages also carry `"finish_reason"`), and `gen_ai.system_instructions` is a flat part
+list. A part is `{"type": "text", "content": ...}` for text, `reasoning`, and `refusal`;
+`{"type": "tool_call", "id", "name", "arguments"}` for a tool invocation; and
+`{"type": "tool_call_response", "id", "response"}` for its result. Image, audio, video, and file
+blocks record their kind and a URL if they have one — inline bytes are dropped, since a base64
+payload would dominate the span.
+
+The GenAI conventions are still development-stability and their message shape has changed before,
+so treat these shapes as current-as-implemented rather than frozen.
+
 See [CONFIGURATION.md](CONFIGURATION.md) to add an LLM client, target, or algorithm.

@@ -2,6 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Process-wide tracing and OpenTelemetry setup for server hosts.
+//!
+//! Export is driven by the standard OTLP environment variables read here
+//! (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_SDK_DISABLED`, ...).
+//! One further variable affects what traces contain rather than where they go:
+//! `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`, which is off unless set to
+//! `true` or `1` and, when set, puts the full prompt and completion of every model
+//! call into the exported spans. That is a deliberate data-handling choice, not a
+//! verbosity level — see `switchyard-server`'s README and the `content_capture`
+//! module of `switchyard-llm-client`, which reads it, for what it exposes.
 
 use std::env;
 use std::sync::OnceLock;

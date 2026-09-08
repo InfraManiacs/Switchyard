@@ -262,7 +262,7 @@ impl TranslatingLlmClient {
         let streaming = endpoint.allows_streaming()
             && body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let url = endpoint.url(backend);
-        record_gen_ai_request(&url, model, streaming);
+        record_gen_ai_request(&url, backend, model, streaming);
 
         let max_retries = u64::from(backend.max_retries());
         let max_attempts = max_retries + 1;
@@ -688,20 +688,61 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn record_gen_ai_request(url: &str, model: &str, streaming: bool) {
+fn record_gen_ai_request(url: &str, backend: &Backend, model: &str, streaming: bool) {
     let span = tracing::Span::current();
     span.record("gen_ai.request.model", model);
     if streaming {
         span.record("gen_ai.request.stream", true);
     }
-    if let Ok(url) = reqwest::Url::parse(url) {
-        if let Some(host) = url.host_str() {
-            span.record("server.address", host);
-        }
+    let host = reqwest::Url::parse(url).ok().and_then(|url| {
         if let Some(port) = url.port_or_known_default() {
             span.record("server.port", i64::from(port));
         }
+        url.host_str().map(str::to_ascii_lowercase)
+    });
+    span.record(
+        "gen_ai.provider.name",
+        provider_name(backend, host.as_deref()),
+    );
+    if let Some(host) = host {
+        span.record("server.address", host.as_str());
     }
+}
+
+/// Resolves the OpenTelemetry `gen_ai.provider.name` for a configured backend.
+///
+/// The attribute names a *provider*, not a wire format, and most providers here are
+/// reached through an OpenAI- or Anthropic-compatible API, so the configured base
+/// URL's host is what actually identifies them. Hosts this deployment recognizes map
+/// to the convention's well-known values, except `nvidia` and `openrouter`, which the
+/// convention does not enumerate and which are recorded verbatim because Switchyard
+/// treats both as first-class backends.
+///
+/// An unrecognized host falls back to the provider its wire format implies — the
+/// identity a compatible gateway presents. `server.address` on the same span always
+/// carries the concrete host, so a gateway behind that fallback stays
+/// distinguishable.
+fn provider_name(backend: &Backend, host: Option<&str>) -> &'static str {
+    let known = host.and_then(|host| match host {
+        "api.openai.com" => Some("openai"),
+        "api.anthropic.com" => Some("anthropic"),
+        "api.x.ai" => Some("x_ai"),
+        "api.deepseek.com" => Some("deepseek"),
+        "api.mistral.ai" => Some("mistral_ai"),
+        "api.perplexity.ai" => Some("perplexity"),
+        "api.cohere.com" | "api.cohere.ai" => Some("cohere"),
+        "generativelanguage.googleapis.com" => Some("gcp.gemini"),
+        "openrouter.ai" => Some("openrouter"),
+        host if host.ends_with(".openai.azure.com") => Some("azure.ai.openai"),
+        host if host.ends_with(".groq.com") => Some("groq"),
+        host if host.ends_with(".api.nvidia.com") => Some("nvidia"),
+        host if host.ends_with("aiplatform.googleapis.com") => Some("gcp.vertex_ai"),
+        _ => None,
+    });
+    known.unwrap_or(match backend {
+        Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => "openai",
+        Backend::Anthropic(_) => "anthropic",
+    })
 }
 
 fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
@@ -939,6 +980,30 @@ mod tests {
             extra_body: BTreeMap::new(),
             max_retries: 0,
         }
+    }
+
+    /// Provider identity comes from the configured host; an unrecognized host —
+    /// a self-hosted or gateway deployment — falls back to the wire format's provider.
+    #[test]
+    fn provider_name_reads_the_host_before_the_wire_format() {
+        let openai = Backend::OpenAiChat(config("https://example.test/v1"));
+        let anthropic = Backend::Anthropic(config("https://example.test/v1"));
+        for (host, expected) in [
+            ("api.openai.com", "openai"),
+            ("api.anthropic.com", "anthropic"),
+            ("openrouter.ai", "openrouter"),
+            ("integrate.api.nvidia.com", "nvidia"),
+            ("my-resource.openai.azure.com", "azure.ai.openai"),
+            ("api.groq.com", "groq"),
+        ] {
+            assert_eq!(provider_name(&openai, Some(host)), expected, "{host}");
+        }
+        assert_eq!(provider_name(&openai, Some("llm.internal.test")), "openai");
+        assert_eq!(
+            provider_name(&anthropic, Some("llm.internal.test")),
+            "anthropic"
+        );
+        assert_eq!(provider_name(&anthropic, None), "anthropic");
     }
 
     fn config_with_retries(base_url: &str, max_retries: u32) -> HttpBackendConfig {

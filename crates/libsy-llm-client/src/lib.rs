@@ -18,6 +18,7 @@
 
 pub mod backend;
 pub mod client;
+mod content_capture;
 pub mod error;
 pub mod metrics;
 mod observability;

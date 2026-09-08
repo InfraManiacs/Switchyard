@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use parking_lot::Mutex;
@@ -49,12 +49,24 @@ pub async fn run(
     let algorithm_name = algorithm.name().to_string();
     let run_started = Instant::now();
     let routing_clients = clients.clone();
+    // Read before routing: a routing outcome overwrites the addressed model with the
+    // target it selected, so this is the only point that still sees the route the
+    // caller asked for.
+    let route = request.model_id().map(|route| route.to_string());
     // This says if we have an observer, put Some(..) in routing_observations.
     // No observer means we don't want any routing_observations.
     let routing_observations = observer.as_ref().map(|_| Arc::new(Mutex::new(Vec::new())));
     let outcome = drive(algorithm, request, {
         let routing_observations = routing_observations.clone();
-        move |call| serve(routing_clients.clone(), call, routing_observations.clone())
+        let route = route.clone();
+        move |call| {
+            serve(
+                routing_clients.clone(),
+                call,
+                routing_observations.clone(),
+                route.clone(),
+            )
+        }
     })
     .await;
     let answered_model = outcome
@@ -82,7 +94,10 @@ pub async fn run(
             &algorithm_name,
             &outcome.request,
             &outcome.selected_model_ids,
-            CallPhase::Completion,
+            CallPhase::Completion {
+                routing_overhead: overhead,
+            },
+            route.as_deref(),
             &observe,
         )
         .await;
@@ -112,8 +127,9 @@ pub async fn decide(
     request: Request,
 ) -> Result<RoutingOutcome> {
     let routing_clients = clients.clone();
+    let route = request.model_id().map(|route| route.to_string());
     let mut outcome = drive(algorithm, request, move |call| {
-        serve(routing_clients.clone(), call, None)
+        serve(routing_clients.clone(), call, None, route.clone())
     })
     .await?;
     let selected_model_id = outcome.selected_model_id()?.clone();
@@ -151,6 +167,7 @@ async fn serve(
     clients: ClientRouter,
     call: CallModel,
     observations: Option<Arc<Mutex<Vec<LlmCallObservation>>>>,
+    route: Option<String>,
 ) -> Result<()> {
     let observe = |observation| {
         if let Some(observations) = &observations {
@@ -163,6 +180,7 @@ async fn serve(
         &call.request,
         &call.models,
         CallPhase::Routing,
+        route.as_deref(),
         &observe,
     )
     .await;
@@ -171,7 +189,11 @@ async fn serve(
 
 enum CallPhase {
     Routing,
-    Completion,
+    /// The terminal call, made once the algorithm has produced a routing outcome.
+    /// It carries the time that took, which no routing-time call can know yet.
+    Completion {
+        routing_overhead: Duration,
+    },
 }
 
 /// Try candidates in order until one succeeds or a failure stops fallback.
@@ -181,12 +203,19 @@ async fn call_first_available(
     request: &Request,
     models: &[ModelId],
     phase: CallPhase,
+    route: Option<&str>,
     observe: &(dyn Fn(LlmCallObservation) + Send + Sync),
 ) -> Result<Response> {
+    let routing_overhead = match phase {
+        CallPhase::Routing => None,
+        CallPhase::Completion { routing_overhead } => Some(routing_overhead),
+    };
     for (index, target) in models.iter().enumerate() {
         let request = match phase {
             CallPhase::Routing => clients.prepare_routing_request(request.clone(), target),
-            CallPhase::Completion => clients.prepare_completion_request(request.clone(), target),
+            CallPhase::Completion { .. } => {
+                clients.prepare_completion_request(request.clone(), target)
+            }
         };
         match call_one(
             clients,
@@ -196,6 +225,8 @@ async fn call_first_available(
             observe,
             index,
             models.len(),
+            route,
+            routing_overhead,
         )
         .await
         {
@@ -226,11 +257,15 @@ async fn call_first_available(
         switchyard.algorithm = algorithm,
         switchyard.candidate = index + 1,
         switchyard.candidate_count = count,
+        switchyard.route = tracing::field::Empty,
+        switchyard.target.name = tracing::field::Empty,
+        switchyard.routing_overhead_ms = tracing::field::Empty,
         selected_model = %model_id,
         otel.kind = "client",
         otel.name = %format_args!("chat {model_id}"),
         openinference.span.kind = "LLM",
         gen_ai.operation.name = "chat",
+        gen_ai.provider.name = tracing::field::Empty,
         gen_ai.request.model = %model_id,
         gen_ai.request.stream = tracing::field::Empty,
         gen_ai.request.temperature = tracing::field::Empty,
@@ -265,8 +300,24 @@ async fn call_one(
     index: usize,
     // count is for span log
     count: usize,
+    // route is for span log: the route the caller addressed, before target selection
+    route: Option<&str>,
+    // routing_overhead is for span log; absent on routing-time calls, which precede it
+    routing_overhead: Option<Duration>,
 ) -> Result<Response> {
     let span = tracing::Span::current();
+    if let Some(route) = route {
+        span.record("switchyard.route", route);
+    }
+    if let Some(target_name) = clients.target_name(model_id) {
+        span.record("switchyard.target.name", target_name);
+    }
+    if let Some(overhead) = routing_overhead {
+        span.record(
+            "switchyard.routing_overhead_ms",
+            overhead.as_secs_f64() * 1_000.0,
+        );
+    }
     observability::record_gen_ai_request(&span, &request.llm_request);
     if let Some(session_id) = request
         .metadata
@@ -339,12 +390,17 @@ pub struct ClientRouter {
     inner: Arc<ClientRouting>,
 }
 
+// Clone exists only so `with_target_names` can rewrite the mapping at configuration
+// time; the shared `Arc` is what every request clone actually copies.
+#[derive(Clone)]
 struct ClientRouting {
     routing: Routing,
     target_prompts: HashMap<ModelId, String>,
+    target_names: HashMap<ModelId, String>,
     routing_answer_target: Option<ModelId>,
 }
 
+#[derive(Clone)]
 enum Routing {
     /// One client serves every model.
     Single(Arc<dyn RoutedLlmClient>),
@@ -372,9 +428,31 @@ impl ClientRouter {
             inner: Arc::new(ClientRouting {
                 routing: Routing::ByModel(by_model),
                 target_prompts,
+                target_names: HashMap::new(),
                 routing_answer_target,
             }),
         }
+    }
+
+    /// Attach the configured target name for each model, for telemetry only.
+    ///
+    /// A deployment names its targets (`capable`, `efficient`, ...) and resolves each
+    /// to an upstream model id. Routing works entirely in model ids, so the names are
+    /// otherwise lost by the time a call is made — but they are the stable label a
+    /// trace needs, because the name outlives the model id it currently points at.
+    /// Models without an entry simply record no name.
+    pub fn with_target_names(mut self, target_names: HashMap<ModelId, String>) -> Self {
+        // Cloning is cheap here and happens once at configuration time: the router is
+        // built before it is shared, so this never copies a live mapping.
+        let mut inner = Arc::unwrap_or_clone(self.inner);
+        inner.target_names = target_names;
+        self.inner = Arc::new(inner);
+        self
+    }
+
+    /// The configured target name serving `model`, when the deployment supplied one.
+    fn target_name(&self, model: &ModelId) -> Option<&str> {
+        self.inner.target_names.get(model).map(String::as_str)
     }
 
     /// A router that serves every model with one client — the single-provider case.
@@ -387,6 +465,7 @@ impl ClientRouter {
             inner: Arc::new(ClientRouting {
                 routing: Routing::Single(client),
                 target_prompts: HashMap::new(),
+                target_names: HashMap::new(),
                 routing_answer_target: None,
             }),
         }
