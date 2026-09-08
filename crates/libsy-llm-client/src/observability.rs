@@ -10,13 +10,21 @@ use opentelemetry::{Array as OtelArray, StringValue, Value as OtelValue};
 use switchyard_libsy::{LibsyError, Result};
 use switchyard_protocol::{
     AggLlmResponse, LlmClientError, LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream,
-    LlmResponseStreamEvent, Response, StopReason, Usage,
+    LlmResponseStreamEvent, Response, ResponseAccumulator, StopReason, Usage,
 };
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::content_capture;
+
 /// Records request parameters represented directly by the neutral IR.
 pub(crate) fn record_gen_ai_request(span: &Span, request: &LlmRequest) {
+    record_captured_content(span, "gen_ai.input.messages", || {
+        content_capture::input_messages(request)
+    });
+    record_captured_content(span, "gen_ai.system_instructions", || {
+        content_capture::system_instructions(request)
+    });
     if request.stream {
         span.record("gen_ai.request.stream", true);
     }
@@ -90,13 +98,38 @@ fn observe_client_stream(stream: LlmResponseStream, span: Span) -> LlmResponseSt
         observer: Some(ClientStreamObserver {
             span,
             outcome: Outcome::Open,
+            // Only an opted-in process pays to fold the stream a second time.
+            content: content_capture::enabled().then(ResponseAccumulator::new),
         }),
     })
+}
+
+/// Writes an opt-in content attribute straight onto the OpenTelemetry span.
+///
+/// Content bypasses `tracing` fields on purpose: a `tracing` field is rendered by
+/// every subscriber layer, including the server's stderr formatter, so recording a
+/// prompt as a field would copy it into the process log as well as the trace. This
+/// writes only to the exported span. `build` runs only once capture is enabled, so a
+/// default-configured process never serializes content at all.
+fn record_captured_content(
+    span: &Span,
+    attribute: &'static str,
+    build: impl FnOnce() -> Option<String>,
+) {
+    if !content_capture::enabled() {
+        return;
+    }
+    if let Some(value) = build() {
+        span.set_attribute(attribute, value);
+    }
 }
 
 fn record_gen_ai_response(span: &Span, response: &AggLlmResponse) {
     record_optional(span, "gen_ai.response.id", response.id.as_deref());
     record_optional(span, "gen_ai.response.model", response.model.as_deref());
+    record_captured_content(span, "gen_ai.output.messages", || {
+        content_capture::output_messages(&response.outputs)
+    });
     record_finish_reasons(
         span,
         response
@@ -159,7 +192,7 @@ fn record_finish_reasons(span: &Span, reasons: impl IntoIterator<Item = impl Int
     }
 }
 
-fn stop_reason_name(reason: StopReason) -> &'static str {
+pub(crate) fn stop_reason_name(reason: StopReason) -> &'static str {
     match reason {
         StopReason::EndTurn => "end_turn",
         StopReason::MaxTokens => "max_tokens",
@@ -259,6 +292,9 @@ enum Outcome {
 struct ClientStreamObserver {
     span: Span,
     outcome: Outcome,
+    /// Folds the streamed chunks back into response content, present only when the
+    /// operator opted in to content capture.
+    content: Option<ResponseAccumulator>,
 }
 
 impl ClientStreamObserver {
@@ -271,6 +307,9 @@ impl ClientStreamObserver {
         match item {
             Ok(event) => {
                 for chunk in event.normalized() {
+                    if let Some(content) = self.content.as_mut() {
+                        content.push(chunk.clone());
+                    }
                     self.observe_chunk(chunk);
                     if self.outcome == Outcome::Failed {
                         break;
@@ -319,9 +358,19 @@ impl ClientStreamObserver {
 }
 
 impl Drop for ClientStreamObserver {
+    /// The stream is over here — completed, failed, or abandoned — so this is the
+    /// first point at which the whole response content is known. A cancelled stream
+    /// still records what it produced, which is the part that actually reached the
+    /// caller.
     fn drop(&mut self) {
         if self.outcome == Outcome::Open {
             self.span.record("outcome", "cancelled");
+        }
+        if let Some(content) = self.content.take() {
+            let response = content.finish();
+            record_captured_content(&self.span, "gen_ai.output.messages", || {
+                content_capture::output_messages(&response.outputs)
+            });
         }
     }
 }

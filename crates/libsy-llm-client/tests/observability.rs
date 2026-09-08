@@ -10,7 +10,7 @@
 //! and model name. Counters are cumulative across flushes; the helpers take the
 //! latest (max) matching data point.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -32,6 +32,8 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use switchyard_libsy::{
     Algorithm, CapabilityJudgeConfig, ClassifierContractConfig, ClassifyTrigger,
@@ -39,7 +41,10 @@ use switchyard_libsy::{
     LlmClassifierConfig, LlmTaskClassifier, PickerMode, RoutingOutcome, RuntimeModels, StageRouter,
     StageRouterConfig, Step, TaskClassifierConfig,
 };
-use switchyard_llm_client::{ClientRouter, RunObservation, RunObserver};
+use switchyard_llm_client::{
+    Backend, ClientRouter, HttpBackendConfig, ModelConfig, RunObservation, RunObserver,
+    TranslatingLlmClient,
+};
 use switchyard_protocol::{Category, ModelId};
 use switchyard_protocol::{
     ContentBlock, LlmRequest, LlmResponse, Message, Metadata, Request, Response, Role,
@@ -1213,6 +1218,22 @@ async fn successful_run_records_metrics_spans_and_outcome_metadata() -> switchya
         );
     }
     assert_eq!(client_span.fields.get("gen_ai.request.stream"), None);
+    // The route the caller addressed, kept alongside the target that served it.
+    assert_eq!(
+        client_span
+            .fields
+            .get("switchyard.route")
+            .map(String::as_str),
+        Some("auto")
+    );
+    // The terminal call knows how long routing took; a routing-time call cannot.
+    assert!(
+        client_span
+            .fields
+            .get("switchyard.routing_overhead_ms")
+            .is_some_and(|overhead| overhead.parse::<f64>().is_ok()),
+        "{client_span:?}"
+    );
 
     let otel_span = find_otel_span(span_exporter, "chat obs-success-model", MODEL);
     assert!(matches!(
@@ -1228,6 +1249,19 @@ async fn successful_run_records_metrics_spans_and_outcome_metadata() -> switchya
         otel_attribute(&otel_span, "gen_ai.usage.input_tokens"),
         Some(&OtelValue::I64(18))
     );
+    // Content capture is opt-in, and this binary never opts in: the always-on
+    // metadata above is everything a default-configured deployment exports.
+    for attribute in [
+        "gen_ai.input.messages",
+        "gen_ai.output.messages",
+        "gen_ai.system_instructions",
+    ] {
+        assert_eq!(
+            otel_attribute(&otel_span, attribute),
+            None,
+            "{attribute} must not be captured without an explicit opt-in"
+        );
+    }
 
     // The algorithm logs why it made the decision.
     let events = store.events();
@@ -1246,6 +1280,105 @@ async fn successful_run_records_metrics_spans_and_outcome_metadata() -> switchya
                     .is_some_and(|message| message.contains("picked"))
         }),
         "no routing-decision log event for {MODEL} in {events:?}"
+    );
+    Ok(())
+}
+
+/// The provider is resolved inside the HTTP client, where the backend is known, and
+/// has to reach the enclosing call span. An unrecognized host — here a local mock —
+/// falls back to the provider the wire format implies, with `server.address` left to
+/// distinguish it.
+#[tokio::test]
+async fn client_call_span_records_the_upstream_provider() -> switchyard_libsy::Result<()> {
+    let _guard = serialize_test().lock().await;
+    let (store, _, _, _, _) = telemetry();
+    const ALGO: &str = "obs-provider-algo";
+    const MODEL: &str = "obs-provider-model";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "provider-answer",
+            "model": MODEL,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        })))
+        .mount(&server)
+        .await;
+    let client = Arc::new(
+        TranslatingLlmClient::new(&[ModelConfig::new(
+            MODEL,
+            Backend::OpenAiChat(HttpBackendConfig {
+                base_url: format!("{}/v1", server.uri()),
+                api_key: None,
+                forward_auth: false,
+                extra_headers: BTreeMap::new(),
+                extra_body: BTreeMap::new(),
+                omit_body_fields: BTreeSet::new(),
+                reasoning_effort: None,
+                max_retries: 0,
+                failure_cooldown: Duration::ZERO,
+                timeout: None,
+            }),
+            None,
+        )])
+        .map_err(|error| LibsyError::external("test", error))?,
+    ) as Arc<dyn RoutedLlmClient>;
+
+    run(
+        algo(ALGO, MODEL),
+        client,
+        request_with_metadata("obs-provider-session", "obs-provider-corr"),
+    )
+    .await?;
+
+    let client_span = find_span(&store.spans(), "libsy.client_call", "selected_model", MODEL);
+    assert_eq!(
+        client_span
+            .fields
+            .get("gen_ai.provider.name")
+            .map(String::as_str),
+        Some("openai")
+    );
+    assert!(client_span.fields.contains_key("server.address"));
+    Ok(())
+}
+
+/// A deployment's target name is the label that survives a model swap, so the
+/// per-call span carries it next to the model id the router actually resolved.
+#[tokio::test]
+async fn client_call_span_names_the_configured_target() -> switchyard_libsy::Result<()> {
+    let _guard = serialize_test().lock().await;
+    let (store, _, _, _, _) = telemetry();
+    const ALGO: &str = "obs-target-name-algo";
+    const MODEL: &str = "obs-target-name-model";
+    let client = Arc::new(UsageClient {
+        usage: Usage::default(),
+    }) as Arc<dyn RoutedLlmClient>;
+    let clients =
+        ClientRouter::new(HashMap::from([(ModelId::from(MODEL), client)])).with_target_names(
+            HashMap::from([(ModelId::from(MODEL), "capable".to_string())]),
+        );
+
+    switchyard_llm_client::run(
+        algo(ALGO, MODEL),
+        clients,
+        request_with_metadata("obs-target-name-session", "obs-target-name-corr"),
+        Arc::new(RuntimeModels::default()),
+        None,
+    )
+    .await?;
+
+    let client_span = find_span(&store.spans(), "libsy.client_call", "selected_model", MODEL);
+    assert_eq!(
+        client_span
+            .fields
+            .get("switchyard.target.name")
+            .map(String::as_str),
+        Some("capable")
     );
     Ok(())
 }

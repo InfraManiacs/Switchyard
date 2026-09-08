@@ -1,0 +1,151 @@
+name: Build and publish container image
+
+# Builds the root Dockerfile (switchyard-server) into a multi-arch GHCR image.
+#
+# Native-runner matrix instead of QEMU: `cargo build --release` inside the
+# Dockerfile is CPU-heavy, and QEMU-emulated arm64 compilation on an amd64
+# runner can run 5-10x+ slower than native. GitHub-hosted Linux ARM64 runners
+# (the `ubuntu-24.04-arm` label) are already used natively in this repo's own
+# publish.yml wheel matrix, which confirms they're available to this
+# org/repo. So each arch is built natively on its matching runner
+# (amd64 -> ubuntu-latest, arm64 -> ubuntu-24.04-arm) and the two resulting
+# single-arch images are combined into one multi-arch manifest list with
+# `docker buildx imagetools create`. This avoids docker/setup-qemu-action
+# entirely for the actual image build. If native ARM64 runners ever stop
+# being available here, fall back to a single job using
+# docker/setup-qemu-action@v3 (the version already pinned in publish.yml)
+# plus `docker/build-push-action` with `platforms: linux/amd64,linux/arm64`.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: lifestyle-aviation-systems/switchyard-server
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Set platform tag pair
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge and push manifest
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Idiomatic metadata-action tagging: full semver on version tags,
+          # plus `:main` and a short-sha tag on pushes to the default branch
+          # for continuous deployment. `latest` is left off deliberately —
+          # the spec calls for exactly these two cases.
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=main,enable={{is_default_branch}}
+            type=sha,enable={{is_default_branch}}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s " *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}

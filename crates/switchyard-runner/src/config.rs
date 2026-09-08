@@ -484,6 +484,10 @@ impl DeploymentConfig {
         } = self.build_route_target_prompts(route_name, route)?;
         let mut by_model = HashMap::new();
         let mut targets_by_model: HashMap<&str, (&str, &TargetConfig)> = HashMap::new();
+        // Model id -> the target alias that selected it, for the
+        // `switchyard.target.name` span field. Distinct from targets_by_model,
+        // which exists to detect two aliases disagreeing on llm_client.
+        let mut target_names = HashMap::new();
         let mut caller_auth = None;
         let mut has_mixed_families = false;
         let mut forwarding_origins = BTreeSet::new();
@@ -529,6 +533,7 @@ impl DeploymentConfig {
             }
             let client: Arc<dyn RoutedLlmClient> = client.clone();
             by_model.insert(target.id.clone(), client);
+            target_names.insert(target.id.clone(), name.to_string());
         }
         // Only forwarding clients count: an api_key_env client sends the server's own key.
         // Forwarding clients must share one credential family unless they all use the same
@@ -555,7 +560,8 @@ impl DeploymentConfig {
             prompts,
             routing_answer_target,
             &completion_targets,
-        );
+        )
+        .with_target_names(target_names);
         Ok((router, caller_auth))
     }
 

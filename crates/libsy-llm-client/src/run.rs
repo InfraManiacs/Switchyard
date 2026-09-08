@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::{StreamExt, TryStreamExt, stream};
 use http::StatusCode;
@@ -63,6 +63,10 @@ pub async fn run(
     let algorithm_name = algorithm.name().to_string();
     let run_started = Instant::now();
     let routing_clients = clients.clone();
+    // Read before routing: a routing outcome overwrites the addressed model with the
+    // target it selected, so this is the only point that still sees the route the
+    // caller asked for.
+    let route = request.model_id().map(|route| route.to_string());
     // This says if we have an observer, put Some(..) in routing_observations.
     // No observer means we don't want any routing_observations.
     let routing_observations = observer.as_ref().map(|_| Arc::new(Mutex::new(Vec::new())));
@@ -71,7 +75,15 @@ pub async fn run(
         None => {
             drive(algorithm, request, models, {
                 let routing_observations = routing_observations.clone();
-                move |call| serve(routing_clients.clone(), call, routing_observations.clone())
+        let route = route.clone();
+        move |call| {
+            serve(
+                routing_clients.clone(),
+                call,
+                routing_observations.clone(),
+                route.clone(),
+            )
+        }
             })
             .await
         }
@@ -112,6 +124,8 @@ pub async fn run(
             &algorithm_name,
             &outcome.request,
             &outcome.selected_model_ids,
+            route.as_deref(),
+            Some(overhead),
             &observe,
         )
         .await
@@ -134,11 +148,12 @@ pub async fn decide(
     models: Arc<RuntimeModels>,
 ) -> Result<RoutingOutcome> {
     let routing_clients = clients.clone();
+    let route = request.model_id().map(|route| route.to_string());
     let mut outcome = match clients.stored_state_owner(&request) {
         Some(owner) => continue_on(owner, algorithm.name(), request),
         None => {
             drive(algorithm, request, models, move |call| {
-                serve(routing_clients.clone(), call, None)
+                serve(routing_clients.clone(), call, None, route.clone())
             })
             .await?
         }
@@ -215,6 +230,7 @@ async fn serve(
     clients: ClientRouter,
     call: Call,
     observations: Option<Arc<Mutex<Vec<RunObservation>>>>,
+    route: Option<String>,
 ) -> Result<()> {
     let call = match call {
         Call::Model(call) => *call,
@@ -232,7 +248,17 @@ async fn serve(
     let algorithm = call.algorithm.clone();
     let candidates = call.models.len();
     call.respond(call_one(
-        &clients, &target, request, &algorithm, &observe, 0, candidates, true,
+        &clients,
+        &target,
+        request,
+        &algorithm,
+        &observe,
+        0,
+        candidates,
+        true,
+        route.as_deref(),
+        // Routing-time calls precede the overhead they contribute to.
+        None,
     ))
     .await
 }
@@ -243,6 +269,10 @@ async fn call_first_available(
     algorithm: &str,
     request: &Request,
     models: &[ModelId],
+    // route is for span log: the route the caller addressed, before target selection
+    route: Option<&str>,
+    // routing_overhead is for span log; absent on routing-time calls, which precede it
+    routing_overhead: Option<Duration>,
     observe: &(dyn Fn(ModelCallObservation) + Send + Sync),
 ) -> Result<Response> {
     for (index, target) in models.iter().enumerate() {
@@ -256,6 +286,8 @@ async fn call_first_available(
             index,
             models.len(),
             false,
+            route,
+            routing_overhead,
         )
         .await
         {
@@ -286,11 +318,15 @@ async fn call_first_available(
         switchyard.algorithm = algorithm,
         switchyard.candidate = index + 1,
         switchyard.candidate_count = count,
+        switchyard.route = tracing::field::Empty,
+        switchyard.target.name = tracing::field::Empty,
+        switchyard.routing_overhead_ms = tracing::field::Empty,
         selected_model = %model_id,
         otel.kind = "client",
         otel.name = %format_args!("chat {model_id}"),
         openinference.span.kind = "LLM",
         gen_ai.operation.name = "chat",
+        gen_ai.provider.name = tracing::field::Empty,
         gen_ai.request.model = %model_id,
         gen_ai.request.stream = tracing::field::Empty,
         gen_ai.request.temperature = tracing::field::Empty,
@@ -326,8 +362,24 @@ async fn call_one(
     // count is for span log
     count: usize,
     buffer: bool,
+    // route is for span log: the route the caller addressed, before target selection
+    route: Option<&str>,
+    // routing_overhead is for span log; absent on routing-time calls, which precede it
+    routing_overhead: Option<Duration>,
 ) -> Result<Response> {
     let span = tracing::Span::current();
+    if let Some(route) = route {
+        span.record("switchyard.route", route);
+    }
+    if let Some(target_name) = clients.target_name(model_id) {
+        span.record("switchyard.target.name", target_name);
+    }
+    if let Some(overhead) = routing_overhead {
+        span.record(
+            "switchyard.routing_overhead_ms",
+            overhead.as_secs_f64() * 1_000.0,
+        );
+    }
     observability::record_gen_ai_request(&span, &request.llm_request);
     if let Some(session_id) = request
         .metadata
@@ -588,6 +640,7 @@ struct ClientRouting {
     routing: Routing,
     decision_clients: HashMap<ModelId, Arc<dyn RoutedDecisionClient>>,
     target_prompts: HashMap<ModelId, String>,
+    target_names: HashMap<ModelId, String>,
     routing_answer_target: Option<ModelId>,
     /// Provider-owned routing pins and materialized cross-format history.
     state_owners: Mutex<StateOwners>,
@@ -595,6 +648,7 @@ struct ClientRouting {
     track_provider_state: bool,
 }
 
+#[derive(Clone)]
 enum Routing {
     /// One client serves every model.
     Single(Arc<dyn RoutedLlmClient>),
@@ -672,11 +726,35 @@ impl ClientRouter {
                 routing: Routing::ByModel(by_model),
                 decision_clients,
                 target_prompts,
+                target_names: HashMap::new(),
                 routing_answer_target,
                 state_owners: Mutex::default(),
                 track_provider_state: spans_providers,
             }),
         }
+    }
+
+    /// Attach the configured target name for each model, for telemetry only.
+    ///
+    /// A deployment names its targets (`capable`, `efficient`, ...) and resolves each
+    /// to an upstream model id. Routing works entirely in model ids, so the names are
+    /// otherwise lost by the time a call is made — but they are the stable label a
+    /// trace needs, because the name outlives the model id it currently points at.
+    /// Models without an entry simply record no name.
+    ///
+    /// Configuration-time only. Mutating through the `Arc` keeps `ClientRouting`
+    /// free of a `Clone` bound it cannot satisfy — it owns a `Mutex` of provider
+    /// state — and the router is always still unique when this is called.
+    pub fn with_target_names(mut self, target_names: HashMap<ModelId, String>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_target_names must be called before the router is shared")
+            .target_names = target_names;
+        self
+    }
+
+    /// The configured target name serving `model`, when the deployment supplied one.
+    fn target_name(&self, model: &ModelId) -> Option<&str> {
+        self.inner.target_names.get(model).map(String::as_str)
     }
 
     /// A router that serves every model with one client — the single-provider case.
@@ -698,6 +776,7 @@ impl ClientRouter {
                 routing: Routing::Single(client),
                 decision_clients,
                 target_prompts: HashMap::new(),
+                target_names: HashMap::new(),
                 routing_answer_target: None,
                 state_owners: Mutex::default(),
                 track_provider_state: false,
