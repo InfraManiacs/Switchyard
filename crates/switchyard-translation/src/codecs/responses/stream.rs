@@ -680,6 +680,8 @@ fn responses_usage(usage: &serde_json::Map<String, Value>) -> Usage {
             .get("total_tokens")
             .and_then(Value::as_u64)
             .or_else(|| Some(aggregate_input_tokens.unwrap_or(0) + output_tokens.unwrap_or(0))),
+        // See the buffered Responses decoder: no cost field in this shape.
+        cost: None,
         reasoning_tokens: usage
             .get("output_tokens_details")
             .and_then(|details| details.get("reasoning_tokens"))

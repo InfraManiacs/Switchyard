@@ -303,6 +303,14 @@ fn openai_usage(usage: &Map<String, Value>) -> Usage {
         cache: Usage::cache_details(cached_input_tokens, cache_creation_input_tokens),
         output_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
         total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+        // Provider-reported cost, same as the buffered decoder. Aggregators
+        // send this in the final usage-bearing chunk.
+        cost: usage.get("cost").and_then(Value::as_f64).or_else(|| {
+            usage
+                .get("cost_details")
+                .and_then(|details| details.get("upstream_inference_cost"))
+                .and_then(Value::as_f64)
+        }),
         reasoning_tokens: usage
             .get("completion_tokens_details")
             .and_then(|details| details.get("reasoning_tokens"))

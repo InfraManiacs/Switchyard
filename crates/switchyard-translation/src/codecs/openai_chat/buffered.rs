@@ -1253,6 +1253,16 @@ pub(crate) fn decode_openai_usage(value: Option<&Value>) -> Usage {
         cache: Usage::cache_details(cached_input_tokens, cache_creation_input_tokens),
         output_tokens: value.get("completion_tokens").and_then(Value::as_u64),
         total_tokens: value.get("total_tokens").and_then(Value::as_u64),
+        // Provider-reported cost. OpenAI itself doesn't send this; aggregators
+        // do (OpenRouter: top-level `cost`, plus a `cost_details` breakdown).
+        // Read it rather than recomputing from tokens — see the field docs on
+        // `Usage::cost` for why a reconstruction is wrong for an aggregator.
+        cost: value.get("cost").and_then(Value::as_f64).or_else(|| {
+            value
+                .get("cost_details")
+                .and_then(|details| details.get("upstream_inference_cost"))
+                .and_then(Value::as_f64)
+        }),
         reasoning_tokens: value
             .get("completion_tokens_details")
             .and_then(|details| details.get("reasoning_tokens"))
@@ -1310,5 +1320,45 @@ pub(crate) fn openai_finish_reason(reason: StopReason) -> &'static str {
         StopReason::ToolUse => "tool_calls",
         StopReason::ContentFilter => "content_filter",
         StopReason::EndTurn | StopReason::Unknown | StopReason::Error => "stop",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // OpenRouter reports what it actually charged on every response. Decoding
+    // it is what keeps cost reporting off token-count reconstructions, which
+    // cannot be correct for an aggregator that picks a different upstream
+    // (and therefore a different rate) per request.
+    #[test]
+    fn decodes_aggregator_reported_cost() {
+        let usage = json!({
+            "prompt_tokens": 50,
+            "completion_tokens": 27,
+            "total_tokens": 77,
+            "cost": 0.000102,
+            "cost_details": {"upstream_inference_cost": 0.000102},
+        });
+        assert_eq!(decode_openai_usage(Some(&usage)).cost, Some(0.000102));
+    }
+
+    // Falls back to the breakdown when the aggregate is absent.
+    #[test]
+    fn falls_back_to_upstream_inference_cost() {
+        let usage = json!({
+            "prompt_tokens": 50,
+            "completion_tokens": 27,
+            "cost_details": {"upstream_inference_cost": 0.000075},
+        });
+        assert_eq!(decode_openai_usage(Some(&usage)).cost, Some(0.000075));
+    }
+
+    // Providers that report no cost (OpenAI itself, self-hosted vLLM) must
+    // leave the field empty rather than inviting a computed stand-in.
+    #[test]
+    fn leaves_cost_unset_when_provider_reports_none() {
+        let usage = json!({"prompt_tokens": 50, "completion_tokens": 27, "total_tokens": 77});
+        assert_eq!(decode_openai_usage(Some(&usage)).cost, None);
     }
 }

@@ -351,6 +351,19 @@ pub struct Usage {
     pub total_tokens: Option<u64>,
     /// Reasoning output tokens, when reported separately.
     pub reasoning_tokens: Option<u64>,
+    /// Provider-reported cost of the call, in the provider's own currency
+    /// units (USD for every provider seen so far).
+    ///
+    /// This is the amount the provider says it charged, not a figure derived
+    /// from token counts and a price table. That distinction matters for
+    /// aggregators: OpenRouter dispatches a single model id to whichever
+    /// upstream is cheapest/available at that moment — the same
+    /// `qwen/qwen3.8-27b` request has been served by Novita, AkashML,
+    /// Ionstream and Reka on one deployment — so a token-count reconstruction
+    /// cannot know which price applied, nor account for cache discounts or
+    /// BYOK. `None` when the provider reports no cost (self-hosted vLLM, and
+    /// providers that omit the field).
+    pub cost: Option<f64>,
 }
 
 /// Optional cache-token detail kept out of the common, cache-free usage allocation.

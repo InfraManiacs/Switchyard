@@ -770,6 +770,7 @@ async fn successful_run_records_metrics_spans_and_decision_log() -> switchyard_l
             output_tokens: Some(7),
             total_tokens: Some(25),
             reasoning_tokens: Some(2),
+            cost: None,
             cache: Usage::cache_details(Some(3), Some(4)),
         },
     }) as Arc<dyn RoutedLlmClient>;

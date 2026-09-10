@@ -1451,6 +1451,10 @@ fn decode_responses_usage(value: Option<&Value>) -> Usage {
                     .zip(output_tokens)
                     .map(|(input, output)| input + output)
             }),
+        // The Responses API shape carries no cost field; aggregator cost is
+        // picked up by the openai_chat codec, which is the format this
+        // platform's llm_clients actually use.
+        cost: None,
         reasoning_tokens: value
             .get("output_tokens_details")
             .and_then(|details| details.get("reasoning_tokens"))
