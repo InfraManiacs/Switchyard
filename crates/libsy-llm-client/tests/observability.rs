@@ -1537,7 +1537,7 @@ impl RoutedLlmClient for StreamingUsageClient {
             json!({"id": "", "choices": [{"index": 0, "delta": {"content": "hello"}}]}),
             json!({"id": "obs-stream-response", "choices": []}),
             json!({"id": "obs-stream-response", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 21, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 8}}}),
+                "usage": {"prompt_tokens": 21, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 8}, "cost": 0.00012745}}),
         ].into_iter().map(|event| {
             Ok(engine.decode_stream_event(&mut state, WireFormat::OpenAiChat, event)
                 .expect("valid Chat fixture"))
@@ -1620,6 +1620,9 @@ async fn streamed_usage_updates_the_client_call_span() -> switchyard_libsy::Resu
         ("gen_ai.usage.input_tokens", "21"),
         ("gen_ai.usage.output_tokens", "5"),
         ("gen_ai.usage.cache_read.input_tokens", "8"),
+        // Provider-reported cost must survive the streaming path, not just the
+        // buffered one: streaming is what real agent harnesses use.
+        ("gen_ai.usage.cost", "0.00012745"),
     ] {
         assert_eq!(
             client_span.fields.get(field).map(String::as_str),
@@ -2344,6 +2347,81 @@ async fn in_flight_gauge_clears_when_a_run_is_abandoned() -> switchyard_libsy::R
     assert_eq!(
         call_span.fields.get("outcome").map(String::as_str),
         Some("error")
+    );
+    Ok(())
+}
+
+/// End-to-end reproduction: a real OpenRouter response body, served over HTTP,
+/// must put the provider-reported cost on the client-call span.
+///
+/// Earlier tests covered `decode_openai_usage` as a pure function and the span
+/// observer with a hand-built `Usage`. Both passed while production captured
+/// cost on only ~1 request in 3, so neither covered the path that actually
+/// breaks: HTTP bytes -> client -> decode -> span.
+#[tokio::test]
+async fn client_call_span_records_provider_reported_cost() -> switchyard_libsy::Result<()> {
+    let _guard = serialize_test().lock().await;
+    let (store, _, _, _, _) = telemetry();
+    const ALGO: &str = "obs-cost-algo";
+    const MODEL: &str = "obs-cost-model";
+    let server = MockServer::start().await;
+    // Body shape copied from a real OpenRouter response captured off the wire.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "gen-cost-test",
+            "model": MODEL,
+            "provider": "Friendli",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 53,
+                "completion_tokens": 27,
+                "total_tokens": 80,
+                "cost": 0.000080192,
+                "is_byok": false,
+                "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                "cost_details": {"upstream_inference_cost": 0.000080192},
+                "completion_tokens_details": {"reasoning_tokens": 0},
+            },
+        })))
+        .mount(&server)
+        .await;
+    let client = Arc::new(
+        TranslatingLlmClient::new(&[ModelConfig::new(
+            MODEL,
+            Backend::OpenAiChat(HttpBackendConfig {
+                base_url: format!("{}/v1", server.uri()),
+                api_key: None,
+                forward_auth: false,
+                extra_headers: BTreeMap::new(),
+                extra_body: BTreeMap::new(),
+                omit_body_fields: BTreeSet::new(),
+                reasoning_effort: None,
+                max_retries: 0,
+                failure_cooldown: Duration::ZERO,
+                timeout: None,
+            }),
+            None,
+        )])
+        .map_err(|error| LibsyError::external("test", error))?,
+    ) as Arc<dyn RoutedLlmClient>;
+
+    run(
+        algo(ALGO, MODEL),
+        client,
+        request_with_metadata("obs-cost-session", "obs-cost-corr"),
+    )
+    .await?;
+
+    let client_span = find_span(&store.spans(), "libsy.client_call", "selected_model", MODEL);
+    assert_eq!(
+        client_span.fields.get("gen_ai.usage.cost").map(String::as_str),
+        Some("0.000080192"),
+        "provider-reported cost missing from the client span; fields present: {:?}",
+        client_span.fields.keys().collect::<Vec<_>>()
     );
     Ok(())
 }

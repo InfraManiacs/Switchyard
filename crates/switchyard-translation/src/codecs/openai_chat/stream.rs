@@ -492,3 +492,40 @@ fn openai_finish_reason(reason: Option<&str>) -> String {
         Some(other) => other.to_string(),
     }
 }
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+    use crate::codecs::stream::StreamTranslationState;
+
+    // OpenRouter emits finish_reason and usage in SEPARATE chunks, usage last.
+    // This reproduces that ordering to prove the decoder surfaces cost from a
+    // trailing usage-only chunk.
+    #[test]
+    fn decodes_cost_from_trailing_usage_chunk() {
+        let mut state = StreamTranslationState::default();
+        let finish = json!({
+            "id": "gen-1", "model": "qwen/qwen3.8-27b",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        });
+        let usage_chunk = json!({
+            "id": "gen-1", "model": "qwen/qwen3.8-27b", "choices": [],
+            "usage": {
+                "prompt_tokens": 63, "completion_tokens": 59, "total_tokens": 122,
+                "cost": 0.00012745,
+                "cost_details": {"upstream_inference_cost": 0.00012745}
+            }
+        });
+        let _ = decode_openai_chat_stream(&mut state, &finish);
+        let out = decode_openai_chat_stream(&mut state, &usage_chunk);
+        let cost = out.iter().find_map(|chunk| match chunk {
+            LlmResponseChunk::Usage(usage) => usage.cost,
+            _ => None,
+        });
+        assert_eq!(
+            cost,
+            Some(0.00012745),
+            "trailing usage chunk must carry cost"
+        );
+    }
+}
