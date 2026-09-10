@@ -1249,6 +1249,9 @@ fn decode_anthropic_usage(value: Option<&Value>) -> Usage {
                 + cache_creation_input_tokens.unwrap_or(0)
                 + output
         }),
+        // Anthropic's Messages API reports no cost field; the openai_chat
+        // codec is where aggregator-reported cost is picked up.
+        cost: None,
         reasoning_tokens: value.get("output_tokens_details").and_then(|details| {
             details
                 .get("thinking_tokens")

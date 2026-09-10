@@ -165,6 +165,14 @@ fn record_gen_ai_usage(span: &Span, usage: &Usage) {
             span.record(field, otel_int(value));
         }
     }
+    // The provider's own reported cost, recorded as a float rather than
+    // derived downstream from token counts and a price table. For an
+    // aggregator those reconstructions are wrong by construction: the
+    // upstream actually serving a given model id varies per request, and the
+    // rate varies with it.
+    if let Some(cost) = usage.cost {
+        span.record("gen_ai.usage.cost", cost);
+    }
 }
 
 // OpenTelemetry integer attributes are signed; token counts are unsigned in the IR.
