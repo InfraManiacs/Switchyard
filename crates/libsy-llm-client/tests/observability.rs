@@ -1795,7 +1795,10 @@ async fn client_call_span_records_provider_reported_cost() -> switchyard_libsy::
 
     let client_span = find_span(&store.spans(), "libsy.client_call", "selected_model", MODEL);
     assert_eq!(
-        client_span.fields.get("gen_ai.usage.cost").map(String::as_str),
+        client_span
+            .fields
+            .get("gen_ai.usage.cost")
+            .map(String::as_str),
         Some("0.000080192"),
         "provider-reported cost missing from the client span; fields present: {:?}",
         client_span.fields.keys().collect::<Vec<_>>()
