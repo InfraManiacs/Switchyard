@@ -56,7 +56,26 @@ pub fn flush_observability() {
     metrics::flush();
 }
 
+/// Header carrying the authenticated caller's identity, as written by the API
+/// gateway in front of this server.
+///
+/// Envoy Gateway's `SecurityPolicy.apiKeyAuth` sets this via its
+/// `forwardClientIDHeader` option: after it validates the caller's API key it
+/// adds the matched *client id* (the Secret's data-key name, e.g. `jsims`) as
+/// this header's value, and with `sanitize` enabled it strips the API key
+/// itself before the request reaches us. The value is therefore an identity
+/// the gateway has already authenticated, not caller-supplied input - a client
+/// cannot set it themselves, because the gateway overwrites it.
+const CLIENT_ID_HEADER: &str = "x-client-id";
+
 /// Creates the server request span with any incoming W3C trace context as its parent.
+///
+/// When the gateway forwarded a caller identity, it is recorded as `user.id`.
+/// That is the attribute Langfuse maps onto its own user dimension (it reads
+/// `user.id` as well as `langfuse.user.id`), so recording it here is what makes
+/// per-caller filtering and cost attribution possible downstream. Absent the
+/// header the field stays unset rather than being filled with a placeholder,
+/// so "no identity" is distinguishable from a real one.
 pub(crate) fn request_span(headers: &HeaderMap) -> tracing::Span {
     let parent = TraceContextPropagator::new().extract(&HeaderExtractor(headers));
     let span = tracing::info_span!(
@@ -64,7 +83,14 @@ pub(crate) fn request_span(headers: &HeaderMap) -> tracing::Span {
         "switchyard.request",
         otel.kind = "server",
         openinference.span.kind = "CHAIN",
+        user.id = tracing::field::Empty,
     );
+    if let Some(client_id) = headers
+        .get(CLIENT_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        span.record("user.id", client_id);
+    }
     let _ = span.set_parent(parent);
     span
 }
@@ -170,13 +196,91 @@ fn env_var_is_true(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
     use axum::http::{HeaderMap, HeaderValue};
     use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
     use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing::Subscriber;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt as _};
+    use tracing_subscriber::registry::LookupSpan;
 
     use super::request_span;
+
+    /// Collects span fields so a test can assert on what was recorded, covering
+    /// both creation-time fields and later `record` calls.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<BTreeMap<String, String>>>);
+
+    struct StringVisitor<'a>(&'a mut BTreeMap<String, String>);
+
+    impl Visit for StringVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S> Layer<S> for Captured
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: LayerContext<'_, S>) {
+            attrs.record(&mut StringVisitor(&mut self.0.lock().unwrap()));
+        }
+
+        fn on_record(&self, _id: &Id, values: &Record<'_>, _ctx: LayerContext<'_, S>) {
+            values.record(&mut StringVisitor(&mut self.0.lock().unwrap()));
+        }
+    }
+
+    #[test]
+    fn request_span_records_forwarded_client_identity() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-id", HeaderValue::from_static("jsims"));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = request_span(&headers);
+        });
+
+        assert_eq!(
+            captured
+                .0
+                .lock()
+                .unwrap()
+                .get("user.id")
+                .map(String::as_str),
+            Some("jsims"),
+            "the gateway-forwarded client id must land on the span as user.id, \
+             which is what Langfuse maps to its user dimension"
+        );
+    }
+
+    #[test]
+    fn request_span_leaves_user_id_unset_without_client_header() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = request_span(&HeaderMap::new());
+        });
+
+        // An unfilled Empty field must stay absent rather than recording a
+        // placeholder, so unattributed traffic is distinguishable from a real
+        // caller literally named "unknown" or "".
+        assert_eq!(captured.0.lock().unwrap().get("user.id"), None);
+    }
 
     #[test]
     fn request_span_continues_incoming_w3c_trace_context() {
