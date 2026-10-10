@@ -1,48 +1,45 @@
 # Desktop app icon
 
-The app icon uses a connected route junction in ice blue and lavender on a dark
-navy tile. The broad strokes remain readable at small Dock sizes.
+The app icon shows a raised titanium railway turnout with pale-blue supports on
+a navy beveled tile. It represents Switchyard routing requests between models.
 
-`icon.png` contains the 1024 × 1024 RGBA source. `icon.icns` contains macOS icon
-sizes from 16 to 1024 pixels. The exterior of the rounded tile is transparent.
-Windows uses the same artwork at 16, 32, 64, 128, and 256 pixels in `icon.ico`.
+`icon.png` is the 1024 × 1024 RGBA source with a transparent tile exterior.
+`icon.icns` contains macOS sizes from 16 to 1024 pixels. `icon.ico` contains
+Windows sizes of 16, 32, 64, 128, and 256 pixels.
+
 The desktop tray uses the separate `tray.png` source; `tray.rgba` contains its
-decoded pixels. `tray.svg` is the editable design reference.
-Windows uses `tray-windows.rgba`, a small color copy of the app icon, so the tray
-icon stays visible on light and dark taskbars. macOS tints the template tray icon.
+decoded pixels, and `tray.svg` is the editable design reference. Windows uses
+`tray-windows.rgba`, a 22 × 22 pixel color copy of the app icon. macOS tints the
+template tray icon.
 
 ## Generation
 
-Gemini 3 Pro Image generated the artwork through Inference Hub using
-`gcp/google/gemini-3-pro-image`.
-
-To generate a replacement, request three distinct route concepts and compare
-them at 16, 32, 64, and 128 pixels. Refine the strongest concept into one
-connected junction. Each request should ask for one image with `n: 1` and
-`size: "1024x1024"`.
+Gemini 3 Pro Image generated the selected artwork through Inference Hub with
+`gcp/google/gemini-3-pro-image`, `n: 1`, and `size: "1024x1024"`.
+The selected image was the polished titanium option from ten refinements of an
+earlier titanium turnout concept. Gemini generated it from a written
+description of that earlier image.
 
 The selected image used this exact prompt:
 
 ```text
-Design one original professional macOS desktop application icon for Switchyard. Switchyard is a Rust LLM router between coding agents and inference servers, selecting the best model for each request. The desktop app manages routes, tool settings, sessions, and usage. Deliver a single square 1024x1024 icon artwork, not a presentation or mockup. Rounded square dark midnight navy tile, subtle refined surface lighting, centered simple abstract routing/switch junction symbol, large bold silhouette with generous negative space, precise smoothly rounded edges, recognizable at 16 to 64 pixels. Restrained premium developer tool aesthetic. No text, no letters, no logo of an existing company, no NVIDIA eye, no brains, robots, circuit boards, fine lines, stars, sparkles, or busy details. Flat front view, no perspective. The tile should fill the square canvas edge to edge, so the rounded tile exterior can be exported with real transparency. Concept: a SINGLE CONNECTED Y shaped route junction, with three broad rounded arms. One vertical trunk starts at bottom center and gently forks into upper-left and upper-right arms. All three arms meet in one smooth central junction with NO gaps, no crossings, no disconnected fragments, no arrows. The left arm is ice blue and the right arm is lavender, blending smoothly at the junction. Use a large centered calm confident minimal raised symbol, not a detailed railway map. Keep the entire symbol INSIDE the tile with at least 160 pixels of interior padding. Plain solid white background outside the rounded dark tile, NO checkerboard. The square dark tile spans pixels 64 through 960 of the canvas, with generous smooth rounded corners.
+Create a refined Switchyard macOS app icon based on this visual description of the selected reference: raised silver titanium paired railway rails, ONE right-hand turnout with one straight continuing main route and one gradually curved branch, dark navy beveled rounded-square tile, restrained cool-blue accents. Generate one new polished 1024x1024 icon refinement. The reference has finely brushed silver rail top faces, charcoal metal rail webs, broad pale-blue base plates around the switch, and a small cool-blue inset near the central frog, all mounted on a textured midnight tile with a thick rounded beveled frame. Improve its clipping and mixed perspective. Reduce and recenter the ENTIRE rail motif so EVERY part, including end faces, foundations and shadows, is safely inside the tile. Leave at least 140 pixels of empty navy tile between EVERY rail end and the nearest tile edge; no rail reaches a tile rim or image boundary. Rail motif bounding box approximately x220..804 and y210..804, tile occupies x70..954 and y70..954. ALL rail endpoints clearly visible and finished, not cropped. Use ONE coherent near-front orthographic camera for the whole object: tile surface, rail top faces, metal side faces, gauge spacing and shadows all follow the same projection. Straight main rail pair stays straight and parallel. Branch rail pair separates gradually beginning tangent, with matching constant gauge along the curve and continuous plausible switch/frog junction. No extra branches, crossings or disconnected rail fragments. Maintain realistic physical extrusion, titanium bevels, softly grounded contact shadows, and large readable shapes. NO text, logos, arrows, trains, scenery, decorative stars or circuit patterns. Simple professional app icon, plain white exterior, no checkerboard. Change only the subtle material, bevel or lighting treatment specified below while keeping the reference turnout concept and corrected generous margins. Variant: bright polished titanium upper bevels with satin silver top faces and graphite side faces; cool pale blue support inlay, frontal orthographic camera, restrained upper-left soft key light. Moderate visible metal thickness and very clean machining. Rail motif small enough for generous interior margins.
 ```
 
 ## Export
 
 1. Preserve the generated image before export.
-2. Isolate the navy tile from its generated white exterior. Fill enclosed mask
-   regions so the symbol stays opaque, and soften the outer mask by 0.35 pixels.
-3. Save the result as a 1024 × 1024 RGBA PNG.
+2. Isolate the navy tile from its white exterior. Fill enclosed mask regions so
+   the rails and supports stay opaque, then soften the outer mask by 0.35 pixels.
+3. Save the result as a 1024 × 1024 RGBA PNG, keeping the artwork inside the tile
+   unchanged.
 4. Run `cargo desktop-icons` from the repository. The Rust command exports
-   `icon.icns`, `icon.ico`, and both tray pixel files on macOS, Linux, or Windows. It uses
-   Lanczos filtering for all desktop sizes from the same `icon.png`.
-5. Inspect the PNG on light, dark, and vivid backgrounds and check the exported
-   icons at small sizes.
+   `icon.icns`, `icon.ico`, and both tray pixel files. It uses Lanczos filtering
+   when resizing the app artwork.
+5. Inspect the PNG on light, dark, and vivid backgrounds and compare the icon at
+   16, 32, 64, and 128 pixels.
 
-Run `cargo desktop-icons --check` to verify the exports without changing files.
-Every desktop build runs this check on every platform, so changing either PNG
-requires regenerating its exports before the app can build. No Windows runner
-is needed to check the Windows icon. Keep both PNG source files as RGBA images
-at their existing sizes (1024 × 1024 and 22 × 22).
-
-Keep the generated artwork inside the tile unchanged during export.
+Run `cargo desktop-icons --check` to verify exports without changing files.
+Every desktop build runs this check on every platform. After changing either
+PNG, regenerate its exports before building. Keep the PNG sources as RGBA
+images at their existing sizes: 1024 × 1024 for the app and 22 × 22 for the tray.
