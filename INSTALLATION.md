@@ -36,6 +36,28 @@ See [Getting Started](docs/getting_started.md#server-path) for a complete TOML
 deployment and [`switchyard-server`](crates/switchyard-server/README.md) for the
 configuration reference.
 
+## Server Credentials
+
+Server configs name credential variables with `api_key_env` in LLM clients or
+decision clients. Opening the desktop app from Finder, the Start menu, or a
+startup service does not give it your terminal's environment.
+On macOS and Windows, run `cargo desktop install` from a terminal where the
+declared variables are set. After the server validates the config, the installer
+saves those credentials in macOS Keychain or Windows Credential Manager for
+that config file. The installed Rust helper owns credential access. Apply and
+Check config ask the helper to validate; server startup uses the same helper.
+It reads saved values only when the environment lacks a declared variable.
+Explicit environment values take precedence; empty or invalid Unicode values
+still fail validation. On macOS, rebuilding the helper changes its signing
+identity, so Keychain may ask you to approve access again.
+
+The installer does not put credentials in app settings, service definitions, or
+logs. Credentials saved for model discovery stay separate from server
+credentials. Reinstalling with a changed variable value updates its saved
+credential. Uninstalling keeps credentials along with the config and history.
+On Linux, provide the declared variables to both the terminal app and the
+systemd user service. The installer does not save Linux credentials.
+
 ## Linux Codex Service
 
 This setup is for single-user Linux machines. It requires a systemd user
@@ -77,8 +99,9 @@ Remove the service and profile with `cargo desktop uninstall`. This also removes
 marked Codex aliases left by older installs from existing `.bashrc` and
 `.zshrc` files. If upgrading an older install, uninstall first and run
 `unalias codex` in any open shell. The server directory, routing records,
-profile backups, and systemd drop-in files stay in place. Use the same path
-overrides when installing and uninstalling.
+profile backups, and systemd drop-in files stay in place. Uninstall uses the
+recorded installation. Conflicting environment overrides require
+`cargo desktop uninstall --settings FILE` to select it explicitly.
 
 ## Windows Desktop App
 

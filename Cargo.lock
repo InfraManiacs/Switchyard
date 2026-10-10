@@ -5110,9 +5110,11 @@ version = "0.3.0"
 dependencies = [
  "mslnk",
  "plist",
+ "security-framework",
  "self-replace",
  "serde",
  "serde_json",
+ "switchyard-runner",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "toml_edit 0.25.13+spec-1.1.0",

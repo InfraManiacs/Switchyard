@@ -438,6 +438,13 @@ pub fn launch_managed(s: &Settings, desktop: bool) -> Result<(), String> {
             ])
             .arg(s.sy_home.join("routing.jsonl"));
     }
+    if !desktop {
+        crate::credentials::configure(
+            &mut c,
+            &s.sy_home.join("composite.toml"),
+            &s.sy_home.join("composite.toml"),
+        )?;
+    }
     let status = c
         .stdin(Stdio::null())
         .stderr(log.try_clone().map_err(|e| e.to_string())?)
@@ -473,9 +480,11 @@ pub fn open(value: &str) -> Result<(), String> {
     }
 }
 pub fn saved_key(base_url: &str) -> Result<Option<String>, String> {
-    let target = wide(std::ffi::OsStr::new(&format!(
-        "Switchyard:model-list:{base_url}"
-    )));
+    read_credential(&format!("Switchyard:model-list:{base_url}"))
+}
+
+pub(crate) fn read_credential(target: &str) -> Result<Option<String>, String> {
+    let target = wide(std::ffi::OsStr::new(target));
     unsafe {
         let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
         if CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) == 0 {
@@ -501,10 +510,12 @@ pub fn saved_key(base_url: &str) -> Result<Option<String>, String> {
     }
 }
 pub fn save_key(base_url: &str, key: &str) -> Result<(), String> {
-    let mut target = wide(std::ffi::OsStr::new(&format!(
-        "Switchyard:model-list:{base_url}"
-    )));
-    let mut bytes = key.trim().as_bytes().to_vec();
+    write_credential(&format!("Switchyard:model-list:{base_url}"), key.trim())
+}
+
+pub(crate) fn write_credential(target: &str, key: &str) -> Result<(), String> {
+    let mut target = wide(std::ffi::OsStr::new(target));
+    let mut bytes = key.as_bytes().to_vec();
     let mut credential: CREDENTIALW = unsafe { std::mem::zeroed() };
     credential.Type = CRED_TYPE_GENERIC;
     credential.TargetName = target.as_mut_ptr();

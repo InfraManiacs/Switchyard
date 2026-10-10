@@ -27,6 +27,39 @@ use crate::{
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIGURED_RETRIES: u32 = 10;
 
+/// This function returns a deployment's declared credential variable names without reading their values.
+/// It parses the deployment and checks its schema version before returning names from LLM and decision clients.
+pub fn api_key_variables(source: &str) -> Result<BTreeSet<String>, RunnerError> {
+    let config: DeploymentConfig = toml::from_str(source).map_err(|_| {
+        RunnerError::configuration(
+            "Could not parse the server config to read credential references.",
+        )
+    })?;
+    if config.schema_version != SUPPORTED_SCHEMA_VERSION {
+        return Err(RunnerError::configuration(
+            "Unsupported server config schema version.",
+        ));
+    }
+    let mut variables: BTreeSet<_> = config
+        .llm_clients
+        .values()
+        .filter_map(|client| client.api_key_env.clone())
+        .collect();
+    for client in config.decision_clients.values() {
+        let DecisionClientConfig::SystemOne { api_key_env, .. } = client;
+        variables.insert(api_key_env.clone());
+    }
+    if variables
+        .iter()
+        .any(|name| name.trim().is_empty() || name.contains(['\0', '=']))
+    {
+        return Err(RunnerError::configuration(
+            "Invalid credential environment variable name.",
+        ));
+    }
+    Ok(variables)
+}
+
 type RunnerResult<T> = Result<T, RunnerError>;
 
 pub(crate) fn load_runner(path: impl AsRef<Path>) -> RunnerResult<Runner> {
@@ -827,9 +860,19 @@ fn read_api_key(client: &str, variable: &str) -> RunnerResult<String> {
             "{client} api_key_env must not be empty"
         )));
     }
+    if variable.contains(['\0', '=']) {
+        return Err(RunnerError::configuration(
+            "Invalid credential environment variable name.",
+        ));
+    }
     let api_key = std::env::var(variable).map_err(|error| {
+        // VarError can contain the raw credential, so errors report only its category.
+        let reason = match error {
+            std::env::VarError::NotPresent => "environment variable not found",
+            std::env::VarError::NotUnicode(_) => "environment variable is not valid Unicode",
+        };
         RunnerError::configuration(format!(
-            "{client} could not read api_key_env {variable}: {error}"
+            "{client} could not read api_key_env {variable}: {reason}"
         ))
     })?;
     if api_key.trim().is_empty() {
@@ -1992,6 +2035,15 @@ confidence_threshold = 0.5
 
     #[test]
     fn api_key_environment_reference_is_validated() {
+        const RAW_KEY_ENV: &str = "SWITCHYARD_CONFIG_TEST_RAW_KEY";
+        if std::env::var_os(RAW_KEY_ENV).is_some() {
+            let error = read_api_key("fixture", RAW_KEY_ENV)
+                .expect_err("invalid raw credential")
+                .to_string();
+            assert!(error.contains("not valid Unicode"));
+            assert!(!error.contains("DUMMY_SECRET_DO_NOT_LOG"));
+            return;
+        }
         let missing = VALID_CONFIG.replacen(
             "base_url = \"https://example.test/v1\"",
             "base_url = \"https://example.test/v1\"\napi_key_env = \"SWITCHYARD_CONFIG_TEST_KEY_THAT_IS_NOT_SET\"",
@@ -2014,6 +2066,40 @@ confidence_threshold = 0.5
             std::env::remove_var(EMPTY_KEY_ENV);
         }
         assert!(message.contains("is empty"));
+        #[cfg(unix)]
+        let raw = {
+            use std::os::unix::ffi::OsStringExt;
+            let mut bytes = b"DUMMY_SECRET_DO_NOT_LOG".to_vec();
+            bytes.push(0xff);
+            std::ffi::OsString::from_vec(bytes)
+        };
+        #[cfg(windows)]
+        let raw = {
+            use std::os::windows::ffi::OsStringExt;
+            let mut words: Vec<_> = "DUMMY_SECRET_DO_NOT_LOG".encode_utf16().collect();
+            words.push(0xd800);
+            std::ffi::OsString::from_wide(&words)
+        };
+        #[cfg(any(unix, windows))]
+        {
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "config::deployment_tests::api_key_environment_reference_is_validated",
+                        "--nocapture",
+                    ])
+                    .env(RAW_KEY_ENV, raw)
+                    .output()
+                    .expect("raw credential regression");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 
     #[test]

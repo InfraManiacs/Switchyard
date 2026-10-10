@@ -296,7 +296,7 @@ fn reinstall_migrates_settings_preserves_data_and_generates_native_launchers() {
             args[0].as_string(),
             Some(
                 s.sy_home
-                    .join("bin/switchyard-server")
+                    .join("bin/switchyard-desktop-install")
                     .to_str()
                     .expect("UTF-8")
             )
@@ -387,6 +387,46 @@ fn invalid_inputs_and_dry_run_have_no_installation_side_effects() {
     )))
     .expect("fixture PATH");
     let binary = env!("CARGO_BIN_EXE_switchyard-desktop-install");
+    for args in [
+        vec!["capture"],
+        vec![
+            "validate",
+            "--server",
+            "relative",
+            "--config",
+            "/candidate",
+            "--scope",
+            "/original",
+        ],
+        vec![
+            "capture",
+            "--server",
+            "/missing",
+            "--config",
+            "/candidate",
+            "--scope",
+            "/original",
+            "extra",
+        ],
+        vec![
+            "validate",
+            "--server",
+            "/missing",
+            "--config",
+            "/candidate\n",
+            "--scope",
+            "/original",
+        ],
+    ] {
+        let output = Command::new(binary)
+            .args(args)
+            .env("PATH", &path)
+            .env("HOME", &f.settings.home)
+            .output()
+            .expect("reject broker input");
+        assert!(!output.status.success());
+        assert_eq!(fs::read_dir(&f.settings.home).expect("home").count(), 0);
+    }
     for (key, value) in [
         ("SY_PROFILE", "../escape"),
         ("SY_PROFILE", "team.dev"),

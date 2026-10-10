@@ -10,6 +10,8 @@ fn main() {
         writeln!(calls, "{args:?}").unwrap();
     }
     match name {
+        // macOS codesign rejects --version, so this fixture must not accept it as a preflight check.
+        "codesign" if args.get(1).is_some_and(|s| s == "--version") => std::process::exit(2),
         "cargo" => {
             let target = &args[args.iter().position(|s| s == "--target-dir").unwrap() + 1];
             let release = Path::new(target).join("release");

@@ -125,13 +125,10 @@ impl ListError {
     }
 }
 
-/// This function says that this process lacks a client's `api_key_env` variable. Apply's
-/// `--dry-run` check runs in this process's environment, so the check cannot
-/// read the key either.
+/// Apply can use saved server credentials when variables are absent; model discovery uses separate keys.
 pub fn missing_env_note(variable: &str) -> String {
     format!(
-        "The app's environment has no {variable}, which Apply needs: add it to the desktop \
-         app's LaunchAgent."
+        "The app's environment has no {variable}. If server validation needs this credential, run cargo desktop install from a terminal where the variable is set to save it on macOS or Windows. On Linux, provide it to the app and server service."
     )
 }
 

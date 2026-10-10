@@ -157,16 +157,23 @@ fn explain(error: String) -> String {
     }
 }
 
-/// This function returns the validator installed beside the app executable.
-/// On macOS, the app bundle and server LaunchAgent use separate copies built by the same install.
+/// This function finds the installed server from the app's installation metadata.
 fn server_binary() -> Result<PathBuf, String> {
-    std::env::current_exe()
-        .map(|exe| exe.with_file_name(switchyard_desktop_install::executable_name("switchyard-server")))
-        .map_err(|error| {
+    let executable = std::env::current_exe().map_err(|error| {
             format!(
                 "Could not find switchyard-server next to the desktop app: {error}. Run cargo desktop install from the Switchyard repository to install it."
             )
-        })
+        })?;
+    let metadata = switchyard_desktop_install::bundle_metadata(&executable);
+    if metadata.try_exists().map_err(|error| error.to_string())? {
+        return switchyard_desktop_install::Settings::load(&metadata)
+            .map(|settings| settings.binary("switchyard-server"));
+    }
+    Ok(
+        executable.with_file_name(switchyard_desktop_install::executable_name(
+            "switchyard-server",
+        )),
+    )
 }
 
 /// This function checks `text` with `switchyard-server --dry-run`, then replaces `path`
@@ -207,7 +214,7 @@ fn save_checked(binary: &Path, path: &Path, original: &str, text: &str) -> Resul
     }
 
     // Name the real file in errors, not the temporary one.
-    check(binary, candidate.path()).map_err(|error| {
+    check(binary, candidate.path(), path).map_err(|error| {
         error.replace(
             &candidate.path().display().to_string(),
             &path.display().to_string(),
@@ -276,19 +283,29 @@ fn back_up(file: &Path, text: &str) -> Result<PathBuf, std::io::Error> {
     ))
 }
 
-/// This function runs `switchyard-server --config <config> --dry-run`, and returns its
-/// error output when the config is invalid.
-fn check(binary: &Path, config: &Path) -> Result<(), String> {
-    let output = Command::new(binary)
+/// This function asks the installed helper to run the server's dry-run on `config`.
+/// The helper reads saved credentials for `scope`, the original config file, when checking an edited candidate.
+fn check(binary: &Path, config: &Path, scope: &Path) -> Result<(), String> {
+    let config = std::fs::canonicalize(config).map_err(|error| error.to_string())?;
+    let scope = std::fs::canonicalize(scope).map_err(|error| error.to_string())?;
+    let helper = binary.with_file_name(switchyard_desktop_install::executable_name(
+        "switchyard-desktop-install",
+    ));
+    let mut validator = Command::new(&helper);
+    validator
+        .arg("validate")
+        .arg("--server")
+        .arg(binary)
         .arg("--config")
-        .arg(config)
-        .arg("--dry-run")
+        .arg(&config)
+        .arg("--scope")
+        .arg(&scope);
+    let output = validator
         .output()
         .map_err(|error| {
             format!(
-                "Could not run {}: {error}. Apply needs switchyard-server next to the desktop \
-                 app. Run cargo desktop install from the Switchyard repository to install it.",
-                binary.display()
+                "Could not run {}: {error}. Apply needs the installed server and credential helper. Run cargo desktop install from the Switchyard repository to install them.",
+                helper.display()
             )
         })?;
     if output.status.success() {
@@ -300,7 +317,12 @@ fn check(binary: &Path, config: &Path) -> Result<(), String> {
 }
 
 pub fn check_config(settings: &Config) -> Result<(), String> {
-    check(&server_binary()?, &settings.config_file).map_err(explain)
+    check(
+        &server_binary()?,
+        &settings.config_file,
+        &settings.config_file,
+    )
+    .map_err(explain)
 }
 
 pub fn restart_checked(settings: &Config) -> Result<String, String> {
@@ -410,14 +432,24 @@ pub fn open_terminal_script(prefix: &str, text: &str) -> Result<(), String> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    const OLD: &str = "schema_version=1\n[targets]\n[routes]\n#old\n";
+    const NEW: &str = "schema_version=1\n[targets]\n[routes]\n#new\n";
+    const NEWER: &str = "schema_version=1\n[targets]\n[routes]\n#newer\n";
     use std::os::unix::fs::PermissionsExt;
 
-    /// This function writes a stand-in for `switchyard-server` that runs `body`.
+    /// The fixture forwards the helper's validation command to a stand-in server that runs `body`.
     fn fake_server(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("switchyard-server");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write script");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("make script executable");
+        let helper = dir.join("switchyard-desktop-install");
+        std::fs::write(&helper, r#"#!/bin/sh
+test "$#" -eq 7 && test "$1" = validate && test "$2" = --server && test "$4" = --config && test "$6" = --scope && test -f "$7" || exit 1
+exec "$3" --config "$5" --dry-run
+"#).expect("write helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+            .expect("make helper executable");
         path
     }
 
@@ -433,7 +465,7 @@ mod tests {
     fn a_config_that_fails_the_check_is_not_saved() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("composite.toml");
-        std::fs::write(&config, "old").expect("write config");
+        std::fs::write(&config, OLD).expect("write config");
         // The real server names the file it was given; the error must name
         // the user's file instead of the temporary copy.
         let binary = fake_server(
@@ -441,7 +473,7 @@ mod tests {
             r#"echo "invalid server config $2: route gateway cannot forward both" >&2; exit 1"#,
         );
 
-        let error = save_checked(&binary, &config, "old", "new").expect_err("check fails");
+        let error = save_checked(&binary, &config, OLD, NEW).expect_err("check fails");
 
         assert_eq!(
             error,
@@ -450,11 +482,11 @@ mod tests {
                 config.display()
             )
         );
-        assert_eq!(std::fs::read_to_string(&config).expect("read"), "old");
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), OLD);
         assert!(backups(dir.path()).is_empty());
         assert_eq!(
             std::fs::read_dir(dir.path()).expect("read dir").count(),
-            2,
+            3,
             "the temporary file is removed"
         );
     }
@@ -463,7 +495,7 @@ mod tests {
     fn a_config_that_passes_the_check_replaces_the_file_and_keeps_a_backup() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("composite.toml");
-        std::fs::write(&config, "old").expect("write config");
+        std::fs::write(&config, OLD).expect("write config");
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640))
             .expect("set permissions");
         let binary = fake_server(
@@ -471,9 +503,9 @@ mod tests {
             r#"grep -q new "$2" && echo "server OK: gateway""#,
         );
 
-        let backup = save_checked(&binary, &config, "old", "new").expect("saved");
+        let backup = save_checked(&binary, &config, OLD, NEW).expect("saved");
 
-        assert_eq!(std::fs::read_to_string(&config).expect("read"), "new");
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), NEW);
         let mode = |path: &Path| {
             std::fs::metadata(path)
                 .expect("metadata")
@@ -483,30 +515,30 @@ mod tests {
         };
         assert_eq!(mode(&config), 0o640, "the file keeps its permissions");
         assert_eq!(backups(dir.path()).len(), 1);
-        assert_eq!(std::fs::read_to_string(&backup).expect("read"), "old");
+        assert_eq!(std::fs::read_to_string(&backup).expect("read"), OLD);
         assert_eq!(mode(&backup), 0o640, "the backup gets the same permissions");
-        save_checked(&binary, &config, "new", "newer").expect("saved again");
+        save_checked(&binary, &config, NEW, NEWER).expect("saved again");
         let mut kept: Vec<_> = backups(dir.path())
             .iter()
             .map(|path| std::fs::read_to_string(path).expect("backup"))
             .collect();
         kept.sort();
-        assert_eq!(kept, ["new", "old"]);
-        assert_eq!(std::fs::read_to_string(&config).expect("read"), "newer");
+        assert_eq!(kept, [NEW, OLD]);
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), NEWER);
     }
 
     #[test]
     fn a_file_that_changes_during_the_check_is_not_replaced() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("composite.toml");
-        std::fs::write(&config, "old").expect("write config");
+        std::fs::write(&config, OLD).expect("write config");
         // Another program saves the file while the check runs.
         let binary = fake_server(
             dir.path(),
             &format!("echo edited-elsewhere > '{}'", config.display()),
         );
 
-        let error = save_checked(&binary, &config, "old", "new").expect_err("file changed");
+        let error = save_checked(&binary, &config, OLD, NEW).expect_err("file changed");
 
         assert!(error.contains(&config.display().to_string()), "{error}");
         assert_eq!(
@@ -521,17 +553,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let real = dir.path().join("dotfiles.toml");
         let link = dir.path().join("composite.toml");
-        std::fs::write(&real, "old").expect("write config");
+        std::fs::write(&real, OLD).expect("write config");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
         let binary = fake_server(dir.path(), r#"echo "server OK: gateway""#);
 
-        save_checked(&binary, &link, "old", "new").expect("saved");
+        save_checked(&binary, &link, OLD, NEW).expect("saved");
 
         let link_type = std::fs::symlink_metadata(&link)
             .expect("metadata")
             .file_type();
         assert!(link_type.is_symlink(), "the link is kept");
-        assert_eq!(std::fs::read_to_string(&real).expect("read"), "new");
+        assert_eq!(std::fs::read_to_string(&real).expect("read"), NEW);
     }
 
     // The subprocess isolates PATH so the launcher fixture rejects the script without opening an app.

@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+pub mod credentials;
 #[cfg(windows)]
 pub mod windows;
 
@@ -667,9 +668,10 @@ fn install(s: &Settings, preserve_profile: bool) -> Result<bool, String> {
     };
     if cfg!(target_os = "macos") {
         run(Command::new("launchctl").arg("help"))?;
-        run(Command::new("codesign").arg("--version"))?;
     } else if cfg!(target_os = "linux") {
-        run(Command::new("systemctl").args(["--user", "show-environment"]))?;
+        run(Command::new("systemctl")
+            .args(["--user", "show-environment"])
+            .stdout(Stdio::null()))?;
     }
     let reconciled = reconcile_desktop_port(s)?;
     println!(
@@ -712,14 +714,32 @@ fn install(s: &Settings, preserve_profile: bool) -> Result<bool, String> {
         )
         .map_err(|e| e.to_string())?;
     }
-    run(Command::new(s.release("switchyard-server"))
-        .arg("--config")
-        .arg(if existing {
-            config.as_path()
-        } else {
-            staged.path()
-        })
-        .arg("--dry-run"))?;
+    let checked_config = if existing {
+        config.as_path()
+    } else {
+        staged.path()
+    };
+    // On macOS, the installed helper can read its Keychain entries while a rebuilt helper has a new signature.
+    if existing
+        && credentials::needs_saved(checked_config)?
+        && s.binary("switchyard-desktop-install")
+            .try_exists()
+            .map_err(|e| e.to_string())?
+    {
+        run(Command::new(s.binary("switchyard-desktop-install"))
+            .arg("validate")
+            .arg("--server")
+            .arg(s.release("switchyard-server"))
+            .arg("--config")
+            .arg(checked_config)
+            .arg("--scope")
+            .arg(&config))?;
+    } else {
+        run(Command::new(s.release("switchyard-server"))
+            .arg("--config")
+            .arg(checked_config)
+            .arg("--dry-run"))?;
+    }
     if !preserve_profile || !s.profile_file().exists() {
         check_public_route(if existing { &config } else { staged.path() }, &s.model)?;
     }
@@ -736,6 +756,17 @@ fn install(s: &Settings, preserve_profile: bool) -> Result<bool, String> {
     } else {
         None
     };
+    fs::create_dir_all(&s.sy_home).map_err(|e| e.to_string())?;
+    // The release helper saves credentials under the identity used by later validation and startup.
+    let mut broker = Command::new(s.release("switchyard-desktop-install"));
+    run(broker
+        .arg("capture")
+        .arg("--server")
+        .arg(s.release("switchyard-server"))
+        .arg("--config")
+        .arg(checked_config)
+        .arg("--scope")
+        .arg(&config))?;
     set_update_state(
         s,
         "running",
@@ -1063,13 +1094,11 @@ fn stage_bundle(s: &Settings, metadata: &str) -> Result<tempfile::TempDir, Strin
     let stage = tempfile::tempdir_in(parent).map_err(|e| e.to_string())?;
     let app = stage.path().join("Switchyard.app");
     let contents = app.join("Contents");
-    for binary in ["switchyard-desktop", "switchyard-server"] {
-        write(
-            &contents.join("MacOS").join(binary),
-            &fs::read(s.release(binary)).map_err(|e| e.to_string())?,
-            true,
-        )?;
-    }
+    write(
+        &contents.join("MacOS/switchyard-desktop"),
+        &fs::read(s.release("switchyard-desktop")).map_err(|e| e.to_string())?,
+        true,
+    )?;
     write(
         &contents.join("Resources/install.toml"),
         metadata.as_bytes(),
@@ -1107,18 +1136,10 @@ fn install_macos(s: &Settings, stage: tempfile::TempDir) -> Result<(), String> {
     }
     let contents = s.app().join("Contents");
     let args = vec![
-        s.sy_home
-            .join("bin/switchyard-server")
-            .display()
-            .to_string(),
-        "--config".into(),
-        s.sy_home.join("composite.toml").display().to_string(),
-        "--host".into(),
-        "127.0.0.1".into(),
-        "--port".into(),
-        s.port.to_string(),
-        "--routing-log-file".into(),
-        s.sy_home.join("routing.jsonl").display().to_string(),
+        s.binary("switchyard-desktop-install").display().to_string(),
+        "serve".into(),
+        "--settings".into(),
+        s.sy_home.join("install.toml").display().to_string(),
     ];
     write(
         &s.service_dir.join(format!("{SERVER}.plist")),
@@ -1160,11 +1181,9 @@ fn systemd_arg(path: &Path) -> String {
 }
 fn install_linux(s: &Settings) -> Result<(), String> {
     let unit = format!(
-        "[Unit]\nDescription=Switchyard local server\n\n[Service]\nType=simple\nExecStart={} --config {} --host 127.0.0.1 --port {} --routing-log-file {}\nRestart=on-failure\nEnvironment=RUST_LOG=info\n\n[Install]\nWantedBy=default.target\n",
-        systemd_arg(&s.sy_home.join("bin/switchyard-server")),
-        systemd_arg(&s.sy_home.join("composite.toml")),
-        s.port,
-        systemd_arg(&s.sy_home.join("routing.jsonl"))
+        "[Unit]\nDescription=Switchyard local server\n\n[Service]\nType=simple\nExecStart={} serve --settings {}\nRestart=on-failure\nEnvironment=RUST_LOG=info\n\n[Install]\nWantedBy=default.target\n",
+        systemd_arg(&s.binary("switchyard-desktop-install")),
+        systemd_arg(&s.sy_home.join("install.toml")),
     );
     write(
         &s.service_dir.join("switchyard.service"),

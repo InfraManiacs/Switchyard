@@ -147,8 +147,12 @@ saving. Refresh keeps drafts, focus, and scroll. Drafts belong to their config
 file. Selecting another file keeps the drafts for the original file. Switching
 algorithms preserves each algorithm's full set of choices.
 
-**Save and restart** checks the complete edited file with the bundled
-server's `--dry-run`. It preserves comments and unrelated tables, saves a backup
+**Save and restart** asks the installed helper to check the complete edited file
+with the installed server's `--dry-run`. The helper reads saved credentials for
+the original config file when its environment lacks a declared variable. See
+[Server Credentials](../../INSTALLATION.md#server-credentials) for credential
+setup and macOS Keychain approval after rebuilding the helper.
+The app preserves comments and unrelated tables, saves a backup
 beside the config, and restarts the server. A failed check leaves the file
 unchanged. A restart failure after saving is reported separately. The app re-reads
 the config and rejects concurrent changes detected before replacement. A draft

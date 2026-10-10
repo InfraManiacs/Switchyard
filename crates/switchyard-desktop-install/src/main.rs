@@ -9,6 +9,64 @@ use switchyard_desktop_install::{Settings, execute};
 const HELP: &str = "Usage: cargo desktop <install | uninstall> [--dry-run]\n\nBuild and install the local server and macOS or Windows desktop app, or Linux terminal app.\nUninstall uses the recorded installation and preserves settings, history, and recovery copies.\n\nDefaults: SY_HOME=~/.switchyard, SY_PORT=4123, SY_PROFILE=sy,\nSY_MODEL=composite-gpt-6-sol-gpt-6-luna, CODEX_HOME=~/.codex.\nExample: SY_PROFILE=team SY_MODEL=my-route cargo desktop install\n\nPreview the installation or removal plan with --dry-run. Installation requires\na Rust toolchain and LaunchAgents (macOS) or a systemd user session (Linux).\nWindows requires MSVC build tools, WebView2, and a Task Scheduler user session.\nThe Cargo command waits for completion. On Windows, running the installed installer\nstarts a temporary process and returns; read SY_HOME/logs/update.log for progress and errors.\nUse uninstall --settings FILE to select another recorded installation.\nPreview its removal with: cargo desktop uninstall --settings FILE --dry-run";
 
 fn run() -> Result<(), String> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|a| matches!(a.as_str(), "capture" | "validate"))
+    {
+        let [
+            action,
+            server_flag,
+            server,
+            config_flag,
+            config,
+            scope_flag,
+            scope,
+        ] = args.as_slice()
+        else {
+            return Err("Invalid credential command arguments.".into());
+        };
+        if server_flag != "--server"
+            || config_flag != "--config"
+            || scope_flag != "--scope"
+            || [server, config, scope]
+                .iter()
+                .any(|p| !Path::new(p).is_absolute() || p.chars().any(|c| c.is_ascii_control()))
+        {
+            return Err("Invalid credential command arguments.".into());
+        }
+        return switchyard_desktop_install::credentials::validate(
+            Path::new(server),
+            Path::new(config),
+            Path::new(scope),
+            action == "capture",
+        );
+    }
+    #[cfg(unix)]
+    if let [action, flag, file] = std::env::args().skip(1).collect::<Vec<_>>().as_slice()
+        && action == "serve"
+        && flag == "--settings"
+    {
+        use std::os::unix::process::CommandExt;
+        // Exec preserves the service manager's PID while the helper supplies saved credentials.
+        let s = Settings::load(Path::new(file))?;
+        let config = s.sy_home.join("composite.toml");
+        let mut server = std::process::Command::new(s.binary("switchyard-server"));
+        switchyard_desktop_install::credentials::configure(&mut server, &config, &config)?;
+        let error = server
+            .arg("--config")
+            .arg(config)
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &s.port.to_string(),
+                "--routing-log-file",
+            ])
+            .arg(s.sy_home.join("routing.jsonl"))
+            .exec();
+        return Err(format!("Could not start the server: {error}"));
+    }
     #[cfg(windows)]
     if let Some(result) = windows_command()? {
         return result;
@@ -70,10 +128,12 @@ fn run() -> Result<(), String> {
 
 fn main() -> ExitCode {
     #[cfg(windows)]
-    if !std::env::args_os()
-        .nth(1)
-        .is_some_and(|arg| matches!(arg.to_str(), Some("serve" | "desktop" | "apply" | "update")))
-    {
+    if !std::env::args_os().nth(1).is_some_and(|arg| {
+        matches!(
+            arg.to_str(),
+            Some("serve" | "desktop" | "apply" | "update" | "validate" | "capture")
+        )
+    }) {
         unsafe {
             windows_sys::Win32::System::Console::AttachConsole(u32::MAX);
         }
