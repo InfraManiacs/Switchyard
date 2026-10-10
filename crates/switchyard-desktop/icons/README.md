@@ -16,10 +16,6 @@ template tray icon.
 
 Gemini 3 Pro Image generated the selected artwork through Inference Hub with
 `gcp/google/gemini-3-pro-image`, `n: 1`, and `size: "1024x1024"`.
-The selected image was the polished titanium option from ten refinements of an
-earlier titanium turnout concept. Gemini generated it from a written
-description of that earlier image.
-
 The selected image used this exact prompt:
 
 ```text
