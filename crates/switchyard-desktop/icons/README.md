@@ -5,7 +5,11 @@ navy tile. The broad strokes remain readable at small Dock sizes.
 
 `icon.png` contains the 1024 × 1024 RGBA source. `icon.icns` contains macOS icon
 sizes from 16 to 1024 pixels. The exterior of the rounded tile is transparent.
-The menu bar uses the separate tray assets.
+Windows uses the same artwork at 16, 32, 64, 128, and 256 pixels in `icon.ico`.
+The desktop tray uses the separate `tray.png` source; `tray.rgba` contains its
+decoded pixels. `tray.svg` is the editable design reference.
+Windows uses `tray-windows.rgba`, a small color copy of the app icon, so the tray
+icon stays visible on light and dark taskbars. macOS tints the template tray icon.
 
 ## Generation
 
@@ -29,10 +33,16 @@ Design one original professional macOS desktop application icon for Switchyard. 
 2. Isolate the navy tile from its generated white exterior. Fill enclosed mask
    regions so the symbol stays opaque, and soften the outer mask by 0.35 pixels.
 3. Save the result as a 1024 × 1024 RGBA PNG.
-4. Resize the PNG with Lanczos filtering into a macOS `.iconset`: 16, 32, 128,
-   256, and 512 pixels, each at 1× and 2×.
-5. Run `iconutil --convert icns --output icon.icns Switchyard.iconset`.
-6. Inspect the PNG on light, dark, and vivid backgrounds. Check the icon at
-   small sizes and verify every ICNS representation after conversion.
+4. Run `cargo desktop-icons` from the repository. The Rust command exports
+   `icon.icns`, `icon.ico`, and both tray pixel files on macOS, Linux, or Windows. It uses
+   Lanczos filtering for all desktop sizes from the same `icon.png`.
+5. Inspect the PNG on light, dark, and vivid backgrounds and check the exported
+   icons at small sizes.
+
+Run `cargo desktop-icons --check` to verify the exports without changing files.
+Every desktop build runs this check on every platform, so changing either PNG
+requires regenerating its exports before the app can build. No Windows runner
+is needed to check the Windows icon. Keep both PNG source files as RGBA images
+at their existing sizes (1024 × 1024 and 22 × 22).
 
 Keep the generated artwork inside the tile unchanged during export.

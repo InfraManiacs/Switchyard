@@ -39,6 +39,9 @@ windows = { version = "0.62.2", features = ["Management_Deployment", "Applicatio
 [target.'cfg(any(target_os = "macos", windows))'.build-dependencies]
 tauri-build = "2"
 
+[build-dependencies]
+switchyard-desktop-icons = { path = "../switchyard-desktop-icons" }
+
 [dev-dependencies]
 # The tests check each edited config with the server's own config parser.
 switchyard-runner.workspace = true

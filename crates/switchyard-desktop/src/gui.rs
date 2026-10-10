@@ -251,13 +251,17 @@ pub fn run(controller: Controller) -> Result<(), String> {
             {
                 app.state::<TrayPreview>().update(app.handle(), &snapshot)?;
             }
+            #[cfg(target_os = "macos")]
+            let tray_pixels = include_bytes!("../icons/tray.rgba");
+            #[cfg(windows)]
+            let tray_pixels = include_bytes!("../icons/tray-windows.rgba");
             TrayIconBuilder::new()
                 .icon(tauri::image::Image::new_owned(
-                    include_bytes!("../icons/tray.rgba").to_vec(),
+                    tray_pixels.to_vec(),
                     22,
                     22,
                 ))
-                .icon_as_template(true)
+                .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("Switchyard — routes and usage")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
