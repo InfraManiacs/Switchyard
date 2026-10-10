@@ -149,25 +149,37 @@ async fn action(
 }
 #[tauri::command]
 async fn choose_path(directory: bool) -> Result<Option<String>, String> {
+    // The blocking worker waits for the picker; rfd opens macOS panels on the main thread.
     tauri::async_runtime::spawn_blocking(move || {
+        let dialog = rfd::FileDialog::new().set_title(if directory {
+            "Choose a Git project folder"
+        } else {
+            "Choose coding-tool settings"
+        });
+        let path = if directory {
+            dialog.pick_folder()
+        } else {
+            dialog.pick_file()
+        };
         #[cfg(windows)]
-        { let dialog = rfd::FileDialog::new();
-        Ok(if directory { dialog.pick_folder() } else { dialog.pick_file() }.map(|p|p.display().to_string())) }
+        {
+            Ok(path.map(|path| path.display().to_string()))
+        }
         #[cfg(target_os = "macos")]
         {
-        let script = if directory {
-            "try\nreturn POSIX path of (choose folder with prompt \"Choose a Git project folder\")\non error number -128\nreturn \"\"\nend try"
-        } else {
-            "try\nreturn POSIX path of (choose file with prompt \"Choose coding-tool settings\")\non error number -128\nreturn \"\"\nend try"
-        };
-        let output = std::process::Command::new("osascript").args(["-e",script]).output().map_err(|e| e.to_string())?;
-        if !output.status.success() {return Err("The file chooser could not open. Enter the full path in the field.".into());}
-        let path=String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-        let path=path.trim_end_matches(['\r','\n']);
-        Ok((!path.is_empty()).then(||path.to_owned()))
+            path.map(|path| {
+                path.into_os_string().into_string().map_err(|_| {
+                    "The selected path cannot be represented as UTF-8. Enter a different path in the field."
+                        .to_string()
+                })
+            })
+            .transpose()
         }
-    }).await.map_err(|e|e.to_string())?
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
+
 fn open_page(app: &tauri::AppHandle, page: &str) {
     if let Some(window) = app.get_webview_window("main") {
         // Only the fixed page names from the tray menu reach this script.

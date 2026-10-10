@@ -60,8 +60,9 @@ function openUsage(group, id) {
 }
 function renderOverview() {
   const metrics=snapshot.metrics,line=node('div',undefined,'connection-line');
-  line.append(node('span',metrics.running?'Connected':'Not responding',metrics.running?'connection-state connected':'connection-state'),node('span',metrics.server_url,'connection-address'));
-  button(line,`Manage ${snapshot.routes.length} routes`,()=>navigate('routes'));if(!metrics.running){button(line,'Check again',()=>refresh());button(line,'Recovery',()=>navigate('settings'));}content.append(line);renderOnboarding();
+  if(metrics.running)line.append(node('span','Connected','connection-state connected'));
+  line.append(node('span',metrics.server_url,'connection-address'));
+  button(line,`Manage ${snapshot.routes.length} routes`,()=>navigate('routes'));content.append(line);renderOnboarding();
   if(usageUnavailable()){const c=card('Usage unavailable');c.append(node('p','The routing log could not be read. Totals and cost estimates are unavailable.'));button(actions(c),'Retry',()=>refresh());button(actions(c),'Open settings',()=>navigate('settings'));return;}
   const controls=node('div',undefined,'analytics-controls');content.append(controls);
   const period=field(controls,'Period',select([['all','All retained history'],['week','Seven local calendar days'],['today','Today']],analyticsView.period));

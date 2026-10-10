@@ -122,7 +122,10 @@ async function refresh(force = true) {
   const saved=snapshot?capturePageState():null;
   document.querySelector('#refresh').setAttribute?.('aria-busy','true');
   try {
-    const latest=await request('snapshot');snapshot=latest;lastRefresh=new Date();stale=false;
+    const latest=await request('snapshot');
+    // A menu, dialog, or action may start while IPC waits; the next poll can apply a fresh snapshot.
+    if(!force&&(busy||document.querySelector('[role="dialog"]')||document.activeElement?.tagName==='SELECT'))return;
+    snapshot=latest;lastRefresh=new Date();stale=false;
     if(force || ['overview','usage','settings'].includes(page)) {render();if(saved)restorePageState(saved);}
     showPageErrors((snapshot.errors||[]).join('\n'));showFreshness();
   } catch(error) {stale=true;showPageErrors(`Could not refresh the page: ${error}`);showFreshness();if(!snapshot)renderRecovery(String(error));}
@@ -250,11 +253,11 @@ function renderSessions() {
   const tool=field(c,'Session coding tool',select(tools.map(t=>[t.tool,`${t.label}${t.available?'':' · not detected'}`]),sessionView.tool||tools[0]?.tool));sessionView.tool=tool.value;
   const account=field(c,'Session account',select([['','Current login'],...(tools.find(t=>t.tool===tool.value)?.accounts||[]).map(n=>[n,n])],sessionView.account));
   const route=routeField(c,sessionView.route,tool.value);
-  const project=field(c,'Project folder (absolute path)',input(sessionView.project));project.placeholder='/Users/you/project';
+  const project=field(c,'Project folder',input(sessionView.project));project.placeholder='Choose a Git checkout folder';
   const info=node('p',undefined,'muted');c.append(info);const preview=node('div');preview.setAttribute('role','status');preview.setAttribute('aria-live','polite');c.append(preview);let plan;
   const a=actions(c),review=button(a,'Review session',async()=>{const reviewed=args();preview.setAttribute('aria-busy','true');preview.textContent='Checking the project and session settings…';try{const r=await readAction({kind:'preview_launch',...reviewed});if(JSON.stringify(reviewed)!==JSON.stringify(args())){preview.textContent='Session inputs changed. Review them again.';return;}plan={reply:r,args:structuredClone(reviewed)};preview.replaceChildren(node('pre',sessionPreviewText(r.data)));r.message=sessionPreviewText(r.data);blocked(launch,false);}catch(error){fieldError(project,String(error));preview.textContent='Session preview unavailable. Correct the project or selected settings and retry.';}finally{preview.setAttribute('aria-busy','false');}}),launch=mutation(a,'Open Terminal…',()=>{if(!plan)return;const reviewed=structuredClone(plan.args),reply=plan.reply;confirmAction('Start this session?',reply.message,'Open Terminal',()=>run({kind:'launch',...reviewed,preview_token:reply.data.preview_token}));},true);
   const args=()=>({tool:tool.value,account:account.value||null,...routeArgs(route),project:project.value});
-  const changed=()=>{Object.assign(sessionView,{tool:tool.value,account:account.value,route:route.value,project:project.value});plan=null;preview.replaceChildren();blocked(launch,true);const t=tools.find(t=>t.tool===tool.value);const incompatible=snapshot.routes.find(r=>r.key===route.value)?.compatibility?.[tool.value];const invalid=!project.value.startsWith('/')?'Enter an absolute project folder. Git validation runs during Review.':'';fieldError(project,invalid);blocked(review,!t?.available||!route.value||Boolean(invalid)||Boolean(incompatible));if(incompatible)preview.append(node('p',incompatible,'field-error'));info.textContent=account.value?`Saved account: ${account.value}. ${t?.account_details?.find(a=>a.name===account.value)?.path||''}. Login status is unknown until the coding tool confirms it.`:t?.status||'Select a coding tool.';if(tool.value==='pi')info.append(node('p','Pi uses isolated session settings. Personal settings and extensions are not copied.'));};
+  const changed=()=>{Object.assign(sessionView,{tool:tool.value,account:account.value,route:route.value,project:project.value});plan=null;preview.replaceChildren();blocked(launch,true);const t=tools.find(t=>t.tool===tool.value);const incompatible=snapshot.routes.find(r=>r.key===route.value)?.compatibility?.[tool.value];fieldError(project,'');blocked(review,!t?.available||!route.value||!project.value||Boolean(incompatible));if(incompatible)preview.append(node('p',incompatible,'field-error'));info.textContent=account.value?`Saved account: ${account.value}. ${t?.account_details?.find(a=>a.name===account.value)?.path||''}. Login status is unknown until the coding tool confirms it.`:t?.status||'Select a coding tool.';if(tool.value==='pi')info.append(node('p','Pi uses isolated session settings. Personal settings and extensions are not copied.'));};
   button(a,'Choose project folder…',()=>choosePath(project,true,changed));
   tool.onchange=()=>{sessionView.account='';sessionView.tool=tool.value;render();};account.onchange=changed;route.onchange=changed;project.oninput=changed;changed();
   if(!snapshot.routes.length){c.append(node('p','Add a route before starting a session.'));button(a,'Choose a route',()=>navigate('routes'));}
@@ -314,7 +317,7 @@ function renderRouteBrowser() {
   c.append(count,layout);layout.append(list,detail);
   const draw=()=>{
     routeView.search=search.value;const routes=snapshot.routes.filter(r=>routeMatches(r,search.value));count.textContent=`${routes.length} of ${snapshot.routes.length} routes`;list.replaceChildren();detail.replaceChildren();
-    if(!routeView.selected)routeView.selected=routes[0]?.key||'';
+    if(!snapshot.routes.some(r=>r.key===routeView.selected))routeView.selected=routes[0]?.key||'';
     for(const route of routes){const b=button(list,'',()=>{routeView.selected=route.key;draw();list.querySelector(`[data-route="${CSS.escape(route.key)}"]`)?.focus();});b.dataset.route=route.key;b.classList.toggle('selected',route.key===routeView.selected);b.setAttribute('aria-pressed',String(route.key===routeView.selected));b.append(node('span',route.id,'route-name'),node('small',snapshot.algorithms.find(a=>a.kind===route.kind)?.title||route.kind),node('small',routeSummary(route)));const badge=node('small','Unsaved edits','draft-badge');badge.hidden=!drafts.get(draftKey(route))?.dirty;b.append(badge);}
     if(!routes.length){list.append(node('p','No routes match your search.','empty-state'));button(list,'Clear search',()=>{search.value='';draw();});return;}
     const route=routes.find(r=>r.key===routeView.selected);
@@ -358,26 +361,32 @@ function renderInstall(tool,parent) {
   const install=mutation(a,'Apply routing…',()=>{if(!plan)return;const selected=plan;confirmAction(`Apply routing to ${tool.label}?`,`${selected.data.proposed}\n\n${selected.data.authentication}\n\nFiles: ${[...new Set(selected.data.changes.map(change=>change.file))].join(', ')}. Switchyard backs up the originals and preserves unrelated settings.`, 'Apply routing',async()=>{if(!c.isConnected||selected!==plan)return;progress.textContent='Saving settings…';const result=await run(selected.action,false);progress.textContent='';if(result)update();});},true);
   const restore=mutation(a,'Review restore…',async()=>{
     blocked(install,true);plan=null;progress.textContent='Checking backup…';
-    const result=await run({kind:'preview_restore',...target()},false);progress.textContent='';if(!result)return;
-    const selectedTarget=target(),data=result.data;
-    confirmAction('Restore coding-tool settings?',[data.warning,...(data.files||[]).map(file=>`${file.action}: ${file.file}${file.backup?`\nOriginal backup: ${file.backup}`:''}`)].join('\n\n'),'Restore settings',async()=>{progress.textContent='Restoring settings…';await run({kind:'restore',...selectedTarget,preview_token:data.preview_token},false);progress.textContent='';update();},update);
+    // The preview and confirmation must use the same destination revision.
+    const selectedTarget=target(),reviewedRevision=revision;
+    const result=await run({kind:'preview_restore',...selectedTarget},false);
+    if(!c.isConnected||reviewedRevision!==revision||JSON.stringify(selectedTarget)!==JSON.stringify(target()))return;
+    progress.textContent='';if(!result)return;
+    const data=result.data;
+    confirmAction('Restore coding-tool settings?',[data.warning,...(data.files||[]).map(file=>`${file.action}: ${file.file}${file.backup?`\nOriginal backup: ${file.backup}`:''}`)].join('\n\n'),'Restore settings',async()=>{if(!c.isConnected||reviewedRevision!==revision||JSON.stringify(selectedTarget)!==JSON.stringify(target()))return;progress.textContent='Restoring settings…';await run({kind:'restore',...selectedTarget,preview_token:data.preview_token},false);progress.textContent='';update();},update);
   });
   const update=()=>{
     Object.assign(installView,{mode:mode.value,account:account.value,route:route.value,file:file.value});
     account.parentElement.hidden=mode.value!=='account';file.parentElement.hidden=mode.value!=='custom';chooseFile.hidden=mode.value!=='custom';
     const requested=++revision;plan=null;blocked(install,true);install.textContent='Checking settings…';comparison.setAttribute('aria-busy','true');comparison.replaceChildren(node('p','Loading settings preview…'));authentication.textContent='';progress.textContent='Checking preview…';
-    const invalid=mode.value==='custom'&&!file.value.startsWith('/');fieldError(file,invalid?'Enter an absolute settings file path.':'');
-    if(invalid||mode.value==='account'&&!account.value){comparison.replaceChildren(node('p',invalid?'Enter a settings file path.':'No saved account is available. Sign in below or choose Detected settings.'));install.textContent='Preview required';comparison.setAttribute('aria-busy','false');progress.textContent='';blocked(restore,true);return;}
-    blocked(restore,true);
+    const invalid=mode.value==='custom'&&(!file.value||/[\r\n]/.test(file.value));fieldError(file,invalid?'Enter an absolute settings file path without line breaks.':'');
+    if(invalid||mode.value==='account'&&!account.value){comparison.replaceChildren(node('p',invalid?'Enter an absolute settings file path.':'No saved account is available. Sign in below or choose Detected settings.'));install.textContent='Preview required';comparison.setAttribute('aria-busy','false');progress.textContent='';blocked(restore,true);return;}
+    blocked(restore,true);restore.title='';
     const incompatible=snapshot.routes.find(r=>r.key===route.value)?.compatibility?.[tool.tool];
-    if(incompatible){comparison.replaceChildren(node('p',incompatible,'field-error'));install.textContent='Choose a compatible route';progress.textContent='Preview unavailable for this tool.';comparison.setAttribute('aria-busy','false');return;}
-    if(!route.value){comparison.replaceChildren(node('p','Choose a route to preview its settings.'));button(comparison,'Choose a route',()=>navigate('routes'));install.textContent='Choose a route';comparison.setAttribute('aria-busy','false');progress.textContent='';return;}
-    const requestedTarget=target(),requestedRoute=routeArgs(route);
+    // A backup can be restored without a route, so check its destination before Apply's route gates.
+    const requestedTarget=target();
     enqueue(async()=>{
       if(!c.isConnected||requested!==revision)return;
       try{
-        let backupReady=false;try{await readAction({kind:'preview_restore',...requestedTarget});backupReady=true;}catch(error){restore.title=String(error);}
+        let backupReady=false;try{await readAction({kind:'preview_restore',...requestedTarget});backupReady=true;}catch(error){if(c.isConnected&&requested===revision)restore.title=String(error);}
         if(!c.isConnected||requested!==revision)return;blocked(restore,!backupReady);
+        if(incompatible){comparison.replaceChildren(node('p',incompatible,'field-error'));install.textContent='Choose a compatible route';progress.textContent='Preview unavailable for this tool.';return;}
+        if(!route.value){comparison.replaceChildren(node('p','Choose a route to preview its settings.'));button(comparison,'Choose a route',()=>navigate('routes'));install.textContent='Choose a route';progress.textContent='';return;}
+        const requestedRoute=routeArgs(route);
         const result=await readAction({kind:'preview_install',...requestedTarget,...requestedRoute});if(!c.isConnected||requested!==revision)return;
         comparison.replaceChildren();const summaries=node('div',undefined,'install-summary');comparison.append(summaries);
         for(const [title,value] of [['Current settings',result.data.current],['After applying routing',result.data.proposed]])if(value){const summary=node('div');summary.append(node('h4',title),node('pre',value));summaries.append(summary);}
@@ -486,7 +495,7 @@ window.addEventListener?.('switchyard-page',event=>{
   navigate(next);if(!snapshot)refresh();
 });
 async function poll() {
-  if(!document.querySelector('[role="dialog"]')&&!busy)await refresh(false);
+  if(!document.querySelector('[role="dialog"]')&&!busy&&document.activeElement?.tagName!=='SELECT')await refresh(false);
   setTimeout(poll,(snapshot?.refresh_seconds||30)*1000);
 }
 content.append(node('p','Loading Switchyard…','empty-state'));

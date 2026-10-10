@@ -31,9 +31,9 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["N
 security-framework = "3"
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 tauri = { version = "2", features = ["tray-icon", "custom-protocol"] }
+rfd = { version = "0.17", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-rfd = { version = "0.17", default-features = false }
 windows = { version = "0.62.2", features = ["Management_Deployment", "ApplicationModel"] }
 
 [target.'cfg(any(target_os = "macos", windows))'.build-dependencies]
