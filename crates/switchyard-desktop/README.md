@@ -143,9 +143,9 @@ applies them. The app keeps drafts during the app session until saving or
 **Discard unsaved edits…**. Discarding changes only resets the editor. **Delete
 route…** removes the selected route after confirmation, preserves its targets
 and endpoint settings, and uses the same validation, backup, and restart as
-saving. Refresh keeps drafts, focus, and scroll. Drafts belong to their config
-file. Selecting another file keeps the drafts for the original file. Switching
-algorithms preserves each algorithm's full set of choices.
+saving. Refresh keeps drafts and scroll and restores focus to matching form fields.
+Drafts belong to their config file. Selecting another file keeps the drafts for
+the original file. Switching algorithms preserves each algorithm's full set of choices.
 
 **Save and restart** asks the installed helper to check the complete edited file
 with the installed server's `--dry-run`. The helper reads saved credentials for
