@@ -69,8 +69,8 @@ These are caller settings, not a native-video or media-processing API in Switchy
 
 ## Model choices
 
-The same upstream HTTP server and Switchyard client work with d3-edge, d3-lite,
-d3-nano, d3-mini, d3-flash and d3. Use the matching checkpoint and served name;
+The published family includes d3-edge, d3-lite, d3-nano, d3-mini, d3-flash and d3,
+with a shared System One HTTP format. Use the matching checkpoint and served name;
 update `decision_targets.judge.id` in the TOML. Pin a model revision when
 downloading it. Larger models need more memory. The full d3 checkpoint is about
 52 GB before runtime memory.
@@ -84,8 +84,9 @@ downloading it. Larger models need more memory. The full d3 checkpoint is about
 | d3-flash | 8.39B |
 | d3 | 26.09B |
 
-These sizes come from the linked collection's model cards. The local checks in
-the worklog identify which models were actually run.
+These sizes come from the linked collection's model cards. Local smoke checks
+used d3-edge on CPU, d3-nano on CPU and GPU, and d3-flash on GPU. The other variants
+were not deployed.
 
 The upstream HTTP server accepts base64 image data URLs. Its Python API also
 accepts remote URLs and local paths, but those forms are rejected by its HTTP
