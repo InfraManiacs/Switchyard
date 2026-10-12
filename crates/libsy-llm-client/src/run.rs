@@ -205,7 +205,8 @@ fn emit_routing_observations(
 
 /// Serve one offloaded call and fulfill its promise.
 ///
-/// LLM failures stop the run unless the call enables recovery. Decision results,
+/// Invalid requests stop the run even when the call enables recovery. Other LLM
+/// failures can be returned to the algorithm for recovery. Decision results,
 /// including client failures, go back to the algorithm for its routing policy.
 async fn serve(
     clients: ClientRouter,
@@ -238,7 +239,18 @@ async fn serve(
     .await
     {
         Ok(response) => call.respond(Ok(response)),
-        Err(error) if call.recover_errors => call.respond(Err(error)),
+        Err(error)
+            if call.recover_errors
+                && !matches!(
+                    &error,
+                    LibsyError::ClientCall {
+                        source: LlmClientError::InvalidRequest { .. },
+                        ..
+                    }
+                ) =>
+        {
+            call.respond(Err(error))
+        }
         Err(error) => call.fail(error),
     }
 }
