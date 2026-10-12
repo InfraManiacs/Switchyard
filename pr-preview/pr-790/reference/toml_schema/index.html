@@ -2300,7 +2300,7 @@ dependencies available in the active virtual environment.</p>
 <td><code>judge_max_images</code></td>
 <td style="text-align: center;">No</td>
 <td>unset</td>
-<td>Capability/custom modes only. <code>0</code> omits images from the judge; <code>N</code> keeps the newest <code>N</code> images across selected messages and nested tool results, in original order. Unset preserves all images. Does not resize images or change the answer request.</td>
+<td>Capability/custom modes only. <code>0</code> omits images from the judge; <code>N &gt; 0</code> rejects judge input exceeding <code>N</code> images across selected messages and nested tool results. Images are not sampled or reordered. Unset preserves all images. Does not resize images or change the answer request.</td>
 </tr>
 <tr>
 <td><code>response_format_type</code></td>
