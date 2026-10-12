@@ -11,6 +11,10 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use switchyard_protocol::{Category, ContentBlock, Message, Role, ToolResult};
 
+mod decision;
+use decision::DecisionClassifier;
+pub use decision::DecisionJudgeConfig;
+
 use super::escalation;
 use super::fall_through::FallThrough;
 use super::util::DEFAULT_JUDGE_MAX_OUTPUT_TOKENS;
@@ -176,42 +180,71 @@ struct TaskInput {
     judge_max_images: Option<usize>,
 }
 
-impl ClassifierInput for TaskInput {
-    fn build_messages(&self, _state: &State, request: &Request) -> Vec<Message> {
-        // The default preserves the whole-task anchor and latest user update. A
-        // configured window widens that to the surrounding conversation.
-        let selected = match self.recent_turn_window {
+impl TaskInput {
+    fn selected_messages<'a>(&self, request: &'a Request) -> Vec<&'a Message> {
+        match self.recent_turn_window {
             Some(window) => trim_messages(&request.llm_request.messages, window),
             None => task_messages(&request.llm_request.messages),
-        };
-        let mut remaining = self.judge_max_images;
-        // Apply the budget newest-first before cloning potentially large image payloads.
-        // Exclude provider-private reasoning and, by default, tool traffic as before.
-        let mut messages: Vec<_> = selected
+        }
+    }
+
+    fn includes(&self, block: &ContentBlock) -> bool {
+        if self.recent_turn_window.is_none() {
+            is_task_content(block)
+        } else {
+            !matches!(block, ContentBlock::Reasoning { .. })
+        }
+    }
+
+    /// Selects conversation content without adding judge instructions.
+    fn messages(&self, request: &Request) -> Vec<Message> {
+        self.selected_messages(request)
             .into_iter()
-            .rev()
             .filter_map(|message| {
-                let mut content: Vec<_> = message
+                let content: Vec<_> = message
                     .content
                     .iter()
-                    .rev()
-                    .filter(|block| {
-                        if self.recent_turn_window.is_none() {
-                            is_task_content(block)
+                    .filter(|block| self.includes(block))
+                    .map(|block| {
+                        if self.judge_max_images == Some(0) {
+                            without_judge_images(block)
                         } else {
-                            !matches!(block, ContentBlock::Reasoning { .. })
+                            block.clone()
                         }
                     })
-                    .map(|block| copy_judge_block(block, &mut remaining))
                     .collect();
-                content.reverse();
                 (!content.is_empty()).then_some(Message {
                     role: message.role,
                     content,
                 })
             })
-            .collect();
-        messages.reverse();
+            .collect()
+    }
+}
+
+impl ClassifierInput for TaskInput {
+    fn validate_request(&self, request: &Request) -> Result<()> {
+        if let Some(limit) = self.judge_max_images.filter(|limit| *limit > 0) {
+            let count: usize = self
+                .selected_messages(request)
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter(|block| self.includes(block))
+                .map(judge_image_count)
+                .sum();
+            if count > limit {
+                return Err(LibsyError::InvalidRequest {
+                    message: format!(
+                        "judge input contains {count} images, exceeding judge_max_images = {limit}; sample images before routing"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn build_messages(&self, _state: &State, request: &Request) -> Vec<Message> {
+        let mut messages = self.messages(request);
         // Only the windowed path carries assistant turns and tool traffic for the judge
         // to be distracted by. The default path is user task messages only — the anchor
         // and the latest follow-up — so there is nothing there to outrank.
@@ -225,32 +258,25 @@ impl ClassifierInput for TaskInput {
     }
 }
 
-/// Copies only retained images, sharing the budget with nested tool results.
-fn copy_judge_block(block: &ContentBlock, remaining: &mut Option<usize>) -> ContentBlock {
+fn judge_image_count(block: &ContentBlock) -> usize {
     match block {
-        ContentBlock::Image { .. } if *remaining == Some(0) => ContentBlock::Text {
+        ContentBlock::Image { .. } => 1,
+        ContentBlock::ToolResult(result) => result.content.iter().map(judge_image_count).sum(),
+        _ => 0,
+    }
+}
+
+/// Omits images without copying their payloads, including within tool results.
+fn without_judge_images(block: &ContentBlock) -> ContentBlock {
+    match block {
+        ContentBlock::Image { .. } => ContentBlock::Text {
             text: "[Image omitted from judge input.]".to_string(),
         },
-        ContentBlock::Image { .. } => {
-            if let Some(count) = remaining {
-                *count -= 1;
-            }
-            block.clone()
-        }
-        ContentBlock::ToolResult(result) if remaining.is_some() => {
-            let mut content: Vec<_> = result
-                .content
-                .iter()
-                .rev()
-                .map(|block| copy_judge_block(block, remaining))
-                .collect();
-            content.reverse();
-            ContentBlock::ToolResult(ToolResult {
-                tool_call_id: result.tool_call_id.clone(),
-                content,
-                is_error: result.is_error,
-            })
-        }
+        ContentBlock::ToolResult(result) => ContentBlock::ToolResult(ToolResult {
+            tool_call_id: result.tool_call_id.clone(),
+            content: result.content.iter().map(without_judge_images).collect(),
+            is_error: result.is_error,
+        }),
         _ => block.clone(),
     }
 }
@@ -261,7 +287,7 @@ struct TaskClassifierPolicy {
 }
 
 impl TaskClassifierPolicy {
-    fn new(config: &TaskClassifierConfig) -> Self {
+    fn new(config: &LlmCapabilityConfig) -> Self {
         Self {
             base_threshold: config.base_threshold,
             threshold_step: config.threshold_step,
@@ -335,34 +361,63 @@ fn capability_evidence(
     }))
 }
 
+/// Settings shared by capability judges and their surrounding route.
 #[derive(Clone, Debug)]
-/// Settings that control capability classifier prompting and routing.
 pub struct TaskClassifierConfig {
-    /// Lowest solve probability that routes a supported task to the efficient target.
-    pub base_threshold: f64,
-    /// Amount added per capability-boundary step.
-    ///
-    /// Supported verdicts use `base_threshold`, uncertain and unmatched verdicts use one
-    /// step, and unsupported verdicts use two steps.
-    pub threshold_step: f64,
+    /// The judge's prediction contract and routing policy.
+    pub judge: CapabilityJudgeConfig,
+    /// Routes to the capable tier on judge client failures and deadlines. Defaults to true.
+    pub fail_open: bool,
     /// How often the classifier re-decides this session's target.
     pub classify_trigger: ClassifyTrigger,
     /// Uses the first user message as the SessionKey for sticky routing when session metadata is unavailable.
     pub message_hash_fallback: bool,
-    /// Trailing conversation turns the judge sees on top of the client
-    /// instructions and the opening task.
-    ///
-    /// `None` (the default) judges the opening task and latest user follow-up.
-    /// `Some(n)` widens that to the client instructions, the opening task, and
-    /// the last `n` turns after it.
+    /// `None` judges the opening task and latest user follow-up. `Some(n)` also
+    /// includes the surrounding conversation using the last `n` turns.
     pub recent_turn_window: Option<usize>,
-    /// Maximum images in the judge's selected messages, keeping the newest first.
-    /// `None` preserves all images; `Some(0)` omits images. The answer request is unchanged.
+    /// Maximum images allowed in the judge's selected messages; excess images cause an error.
+    /// `None` is unlimited; `Some(0)` omits images. The answer request is unchanged.
     pub judge_max_images: Option<usize>,
+}
+
+/// Selects how a capability judge obtains and interprets its prediction.
+#[derive(Clone, Debug)]
+pub enum CapabilityJudgeConfig {
+    /// A structured LLM verdict with a solve probability and capability boundary.
+    Llm(LlmCapabilityConfig),
+    /// A Choice score for the capable candidate succeeding where the efficient one fails.
+    Decision(DecisionJudgeConfig),
+}
+
+impl Default for CapabilityJudgeConfig {
+    fn default() -> Self {
+        Self::Llm(LlmCapabilityConfig::default())
+    }
+}
+
+/// Prompt, output, and solve-probability settings for an LLM capability judge.
+#[derive(Clone, Debug)]
+pub struct LlmCapabilityConfig {
+    /// Lowest solve probability that routes a supported task to the efficient target.
+    pub base_threshold: f64,
+    /// Amount added per capability-boundary step: zero for supported, one for
+    /// uncertain or unmatched, and two for unsupported.
+    pub threshold_step: f64,
     /// Prompt and verdict contract settings for the classifier judge.
     pub contract: ClassifierContractConfig,
     /// Maximum completion tokens available to the classifier verdict.
     pub max_output_tokens: u64,
+}
+
+impl Default for LlmCapabilityConfig {
+    fn default() -> Self {
+        Self {
+            base_threshold: 0.0,
+            threshold_step: 0.0,
+            contract: ClassifierContractConfig::default(),
+            max_output_tokens: DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
+        }
+    }
 }
 
 /// Flat serialized shape that maps prompt settings into the runtime contract.
@@ -370,6 +425,8 @@ pub struct TaskClassifierConfig {
 #[serde(deny_unknown_fields)]
 struct TaskClassifierConfigWire {
     base_threshold: f64,
+    #[serde(default = "default_fail_open")]
+    fail_open: bool,
     #[serde(default)]
     threshold_step: f64,
     #[serde(default)]
@@ -400,16 +457,23 @@ impl<'de> Deserialize<'de> for TaskClassifierConfig {
         }
         contract = contract.with_response_format_type(wire.response_format_type);
         Ok(Self {
-            base_threshold: wire.base_threshold,
-            threshold_step: wire.threshold_step,
+            judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                base_threshold: wire.base_threshold,
+                threshold_step: wire.threshold_step,
+                contract,
+                max_output_tokens: wire.max_output_tokens,
+            }),
+            fail_open: wire.fail_open,
             classify_trigger: wire.classify_trigger,
             message_hash_fallback: wire.message_hash_fallback,
             recent_turn_window: wire.recent_turn_window,
             judge_max_images: wire.judge_max_images,
-            contract,
-            max_output_tokens: wire.max_output_tokens,
         })
     }
+}
+
+const fn default_fail_open() -> bool {
+    true
 }
 
 const fn default_judge_max_output_tokens() -> u64 {
@@ -419,20 +483,17 @@ const fn default_judge_max_output_tokens() -> u64 {
 impl Default for TaskClassifierConfig {
     fn default() -> Self {
         Self {
-            base_threshold: 0.0,
-            threshold_step: 0.0,
+            judge: CapabilityJudgeConfig::default(),
+            fail_open: default_fail_open(),
             classify_trigger: ClassifyTrigger::default(),
             message_hash_fallback: false,
             recent_turn_window: None,
             judge_max_images: None,
-            contract: ClassifierContractConfig::default(),
-            max_output_tokens: DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
         }
     }
 }
 
-impl TaskClassifierConfig {
-    /// Validates routing thresholds before the classifier is constructed.
+impl LlmCapabilityConfig {
     fn validate(&self) -> Result<()> {
         if !(0.0..=1.0).contains(&self.base_threshold) {
             return Err(LibsyError::AlgorithmError {
@@ -463,10 +524,22 @@ impl TaskClassifierConfig {
                 message: "max_output_tokens must be at least 1".to_string(),
             });
         }
-        if self.message_hash_fallback && self.classify_trigger != ClassifyTrigger::NewSession {
+        Ok(())
+    }
+}
+
+impl TaskClassifierConfig {
+    fn validate(&self) -> Result<()> {
+        match &self.judge {
+            CapabilityJudgeConfig::Llm(config) => config.validate()?,
+            CapabilityJudgeConfig::Decision(config) => config.validate()?,
+        }
+        // Only `every_request` is rejected: it retains no target, so a fallback identity has nothing to key on. Both retaining triggers can key the retained target on a message hash when the caller sends no session id.
+        if self.message_hash_fallback && self.classify_trigger == ClassifyTrigger::EveryRequest {
             return Err(LibsyError::AlgorithmError {
-                message: "message_hash_fallback requires classify_trigger = new_session"
-                    .to_string(),
+                message:
+                    "message_hash_fallback requires classify_trigger = new_session or user_turn"
+                        .to_string(),
             });
         }
         Ok(())
@@ -507,8 +580,8 @@ pub struct CustomClassifierConfig {
     pub message_hash_fallback: bool,
     /// Trailing conversation turns shown to the classifier judge.
     pub recent_turn_window: Option<usize>,
-    /// Maximum images in the judge's selected messages, keeping the newest first.
-    /// `None` preserves all images; `Some(0)` omits images. The answer request is unchanged.
+    /// Maximum images allowed in the judge's selected messages; excess images cause an error.
+    /// `None` is unlimited; `Some(0)` omits images. The answer request is unchanged.
     pub judge_max_images: Option<usize>,
     /// Maximum completion tokens available to the classifier verdict.
     pub max_output_tokens: u64,
@@ -539,10 +612,12 @@ impl CustomClassifierConfig {
                 message: "max_output_tokens must be at least 1".to_string(),
             });
         }
-        if self.message_hash_fallback && self.classify_trigger != ClassifyTrigger::NewSession {
+        // Only `every_request` is rejected: it retains no target, so a fallback identity has nothing to key on. Both retaining triggers can key the retained target on a message hash when the caller sends no session id.
+        if self.message_hash_fallback && self.classify_trigger == ClassifyTrigger::EveryRequest {
             return Err(LibsyError::AlgorithmError {
-                message: "message_hash_fallback requires classify_trigger = new_session"
-                    .to_string(),
+                message:
+                    "message_hash_fallback requires classify_trigger = new_session or user_turn"
+                        .to_string(),
             });
         }
         Ok(())
@@ -674,24 +749,30 @@ impl LlmTaskClassifier {
 
     fn build_capability(config: TaskClassifierConfig) -> Result<Self> {
         config.validate()?;
-        let contract = Self::load_capability_contract(&config.contract)?;
         let classify_trigger = config.classify_trigger;
         let message_hash_fallback = config.message_hash_fallback;
-        let classifier: Arc<dyn Classifier<State>> = Arc::new(
-            JudgeClassifier::new(
-                StructuredJudge::new(
-                    TaskInput {
-                        recent_turn_window: config.recent_turn_window,
-                        judge_max_images: config.judge_max_images,
-                    },
-                    contract,
-                    SerdeDecoder::new(),
-                    JudgeRuntimeConfig::new(config.max_output_tokens)?,
-                ),
-                TaskClassifierPolicy::new(&config),
-            )
-            .with_evidence(capability_evidence),
-        );
+        let input = TaskInput {
+            recent_turn_window: config.recent_turn_window,
+            judge_max_images: config.judge_max_images,
+        };
+        let classifier: Arc<dyn Classifier<State>> = match config.judge {
+            CapabilityJudgeConfig::Llm(judge) => Arc::new(
+                JudgeClassifier::new(
+                    StructuredJudge::new(
+                        input,
+                        Self::load_capability_contract(&judge.contract)?,
+                        SerdeDecoder::new(),
+                        JudgeRuntimeConfig::new(judge.max_output_tokens)?,
+                    ),
+                    TaskClassifierPolicy::new(&judge),
+                )
+                .with_error_recovery(config.fail_open)
+                .with_evidence(capability_evidence),
+            ),
+            CapabilityJudgeConfig::Decision(judge) => {
+                Arc::new(DecisionClassifier::new(judge, input, config.fail_open)?)
+            }
+        };
         Self::from_classifier(
             classifier,
             ClassifierRouteConfig {
@@ -767,10 +848,13 @@ impl LlmTaskClassifier {
         inner: Arc<dyn Classifier<State>>,
         config: ClassifierRouteConfig,
     ) -> Result<Self> {
-        if config.message_hash_fallback && config.classify_trigger != ClassifyTrigger::NewSession {
+        // Only `every_request` is rejected: it retains no target, so a fallback identity has nothing to key on. Both retaining triggers can key the retained target on a message hash when the caller sends no session id.
+        if config.message_hash_fallback && config.classify_trigger == ClassifyTrigger::EveryRequest
+        {
             return Err(LibsyError::AlgorithmError {
-                message: "message_hash_fallback requires classify_trigger = new_session"
-                    .to_string(),
+                message:
+                    "message_hash_fallback requires classify_trigger = new_session or user_turn"
+                        .to_string(),
             });
         }
         // Affinity comes first so a retained assignment short-circuits the judge call.
@@ -842,124 +926,65 @@ mod tests {
 
     type CapabilityJudge = StructuredJudge<TaskInput, SerdeDecoder<TaskClassifierVerdict>>;
 
-    /// Image limits span messages and nested tool results without changing the answer input.
-    #[test]
-    fn judge_image_budget_keeps_the_newest_images_and_original_order() -> Result<()> {
-        let image = |name: &str| ContentBlock::Image {
-            source: ImageSource::Url {
-                url: format!("https://example.test/{name}.png"),
-                detail: None,
-            },
-        };
-        let mut request = classify_request();
-        request.llm_request.messages = vec![
-            Message {
-                role: Role::User,
-                content: vec![image("old")],
-            },
-            Message {
-                role: Role::User,
-                content: vec![
-                    ContentBlock::Text {
-                        text: "Compare the screenshots.".into(),
-                    },
-                    image("recent"),
-                    ContentBlock::ToolResult(ToolResult {
-                        tool_call_id: "screenshot".into(),
-                        content: vec![image("newest")],
-                        is_error: Some(false),
-                    }),
-                ],
-            },
-        ];
-        let original = request.llm_request.messages.clone();
-        for (limit, expected) in [
-            (None, 3),
-            (Some(0), 0),
-            (Some(1), 1),
-            (Some(2), 2),
-            (Some(9), 3),
-        ] {
-            let messages = TaskInput {
-                recent_turn_window: Some(10),
-                judge_max_images: limit,
-            }
-            .build_messages(&State::default(), &request);
-            let serialized =
-                serde_json::to_string(&messages).map_err(|e| LibsyError::AlgorithmError {
-                    message: e.to_string(),
-                })?;
-            assert_eq!(
-                serialized.matches("https://example.test/").count(),
-                expected
-            );
-            assert_eq!(serialized.contains("/old.png"), expected == 3);
-            assert_eq!(serialized.contains("/recent.png"), expected >= 2);
-            assert_eq!(serialized.contains("/newest.png"), expected >= 1);
-            assert!(serialized.contains("Compare the screenshots."));
-            assert_eq!(messages[0].role, Role::User);
-            assert!(!messages[0].content.is_empty());
-            if expected == 3 {
-                assert_eq!(&messages[..original.len()], &original);
-            }
-            if expected == 2 {
-                assert_eq!(messages[1], original[1]);
-            }
-            assert_eq!(request.llm_request.messages, original);
+    fn llm_config(base_threshold: f64) -> LlmCapabilityConfig {
+        LlmCapabilityConfig {
+            base_threshold,
+            ..LlmCapabilityConfig::default()
         }
-        Ok(())
     }
 
-    /// Excluded tool images must not consume the task-only judge's image budget.
     #[test]
-    fn task_only_image_budget_ignores_tool_images() {
+    fn judge_image_limit_counts_only_selected_tool_images() -> Result<()> {
         let image = ContentBlock::Image {
             source: ImageSource::Url {
-                url: "data:image/jpeg;base64,aW1hZ2U=".into(),
-                detail: Some("low".into()),
+                url: "https://example.test/image.png".into(),
+                detail: None,
             },
-        };
-        let text = ContentBlock::Text {
-            text: "Inspect this image.".into(),
         };
         let mut request = classify_request();
         request.llm_request.messages = vec![Message {
             role: Role::User,
             content: vec![
-                text.clone(),
                 image.clone(),
                 ContentBlock::ToolResult(ToolResult {
                     tool_call_id: "screenshot".into(),
-                    content: vec![image.clone()],
-                    is_error: Some(true),
+                    content: vec![image],
+                    is_error: None,
                 }),
             ],
         }];
-        let original = request.llm_request.messages.clone();
-        let messages = TaskInput {
+        let mut input = TaskInput {
             recent_turn_window: None,
             judge_max_images: Some(1),
-        }
-        .build_messages(&State::default(), &request);
-        assert_eq!(
-            messages,
-            vec![Message {
-                role: Role::User,
-                content: vec![text, image]
-            }]
-        );
-        assert_eq!(request.llm_request.messages, original);
+        };
+        input.validate_request(&request)?;
+        input.recent_turn_window = Some(10);
+        assert!(matches!(
+            input.validate_request(&request),
+            Err(LibsyError::InvalidRequest { .. })
+        ));
+        input.judge_max_images = Some(0);
+        let messages = input.messages(&request);
+        let omitted = ContentBlock::Text {
+            text: "[Image omitted from judge input.]".into(),
+        };
+        assert_eq!(messages[0].content[0], omitted);
+        let ContentBlock::ToolResult(result) = &messages[0].content[1] else {
+            panic!("expected tool result");
+        };
+        assert_eq!(result.content, vec![omitted]);
+        Ok(())
     }
 
     fn test_config(base_threshold: f64) -> TaskClassifierConfig {
         TaskClassifierConfig {
-            base_threshold,
+            judge: CapabilityJudgeConfig::Llm(llm_config(base_threshold)),
             ..TaskClassifierConfig::default()
         }
     }
 
     fn policy() -> TaskClassifierPolicy {
-        TaskClassifierPolicy::new(&test_config(TEST_THRESHOLD))
+        TaskClassifierPolicy::new(&llm_config(TEST_THRESHOLD))
     }
 
     fn runtime_models() -> HashMap<Category, Vec<ModelId>> {
@@ -1190,7 +1215,10 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let router = Arc::new(LlmTaskClassifier::new(LlmClassifierConfig::Capability {
             config: TaskClassifierConfig {
-                max_output_tokens: 512,
+                judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                    max_output_tokens: 512,
+                    ..llm_config(TEST_THRESHOLD)
+                }),
                 ..test_config(TEST_THRESHOLD)
             },
         })?);
@@ -1212,8 +1240,11 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let router = Arc::new(LlmTaskClassifier::new(LlmClassifierConfig::Capability {
             config: TaskClassifierConfig {
-                contract: ClassifierContractConfig::default()
-                    .with_prompt("Custom capability rubric."),
+                judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                    contract: ClassifierContractConfig::default()
+                        .with_prompt("Custom capability rubric."),
+                    ..llm_config(TEST_THRESHOLD)
+                }),
                 ..test_config(TEST_THRESHOLD)
             },
         })?);
@@ -1361,6 +1392,266 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn decision_judge_routes_on_relative_advantage() -> Result<()> {
+        use crate::{Call, RuntimeModels, drive};
+        use serde_json::json;
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use switchyard_protocol::{
+            BooleanEstimate, DecisionAnswer, DecisionResponse, DecisionValue, Probability,
+            ProviderConfidence,
+        };
+
+        let settings = DecisionJudgeConfig {
+            cutoff: 0.4,
+            instructions: None,
+            candidates: BTreeMap::from([
+                ("a".into(), "capable".into()),
+                ("b".into(), "efficient".into()),
+                ("c".into(), "third".into()),
+            ]),
+            evidence: json!({
+                "candidate_descriptions": {"a": "Profile A", "b": "Profile B", "c": "Profile C"},
+                "reference_cases": [{"task": "Independent example", "observed_solved": {"a": true, "b": null, "c": false}}],
+                "summaries": [],
+            }),
+        };
+        let mut request = classify_session_request();
+        request.llm_request.messages.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    text: "private reasoning".into(),
+                    signature: None,
+                    details: vec![],
+                },
+                ContentBlock::Text {
+                    text: "visible progress".into(),
+                },
+            ],
+        });
+        request
+            .llm_request
+            .messages
+            .push(Message::text(Role::User, "latest follow-up"));
+        let original_messages = request.llm_request.messages.clone();
+        let expected_task = json!([
+            original_messages[0].clone(),
+            Message::text(Role::Assistant, "visible progress"),
+            Message::text(Role::User, "latest follow-up"),
+        ]);
+
+        for (name, score, fail_open, expected) in [
+            ("above", 0.45, true, Some("capable")),
+            ("equal", 0.4, true, Some("efficient")),
+            ("below", 0.39, false, Some("efficient")),
+            ("missing answer", 0.0, true, Some("capable")),
+            ("no distribution", 0.0, true, Some("capable")),
+            ("wrong type", 0.0, true, Some("capable")),
+            ("out of range", 1.1, true, Some("capable")),
+            ("nonfinite", f64::NAN, false, Some("capable")),
+            ("provider error", 0.0, true, Some("capable")),
+            ("provider error", 0.0, false, None),
+            ("dropped reply", 0.0, true, Some("capable")),
+            ("missing candidate", 0.0, true, None),
+            ("image limit", 0.0, true, None),
+        ] {
+            let mut request = request.clone();
+            if name == "image limit" {
+                request.llm_request.messages.push(Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::Image {
+                            source: ImageSource::Url {
+                                url: "https://example.test/frame.png".into(),
+                                detail: None,
+                            },
+                        };
+                        2
+                    ],
+                });
+            }
+            let mut config = settings.clone();
+            if name == "missing candidate" {
+                config.candidates.remove("a");
+            }
+            if name == "below" {
+                config.instructions = Some(
+                    json!({"policy": "Judge capable-only success using the supplied evidence."}),
+                );
+            }
+            let override_instructions = config.instructions.clone();
+            let router: Arc<dyn Algorithm> =
+                Arc::new(LlmTaskClassifier::new(LlmClassifierConfig::Capability {
+                    config: TaskClassifierConfig {
+                        judge: CapabilityJudgeConfig::Decision(config),
+                        fail_open,
+                        recent_turn_window: Some(3),
+                        judge_max_images: Some(1),
+                        classify_trigger: ClassifyTrigger::NewSession,
+                        ..TaskClassifierConfig::default()
+                    },
+                })?);
+            let calls = AtomicUsize::new(0);
+            let serve = |call| {
+                let calls = &calls;
+                let expected_task = &expected_task;
+                let settings = &settings;
+                let override_instructions = &override_instructions;
+                async move {
+                    let Call::Decision(call) = call else {
+                        panic!("judge must use the decision step")
+                    };
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(call.model, "judge");
+                    assert_eq!(call.request.model, Some("judge".into()));
+                    assert_eq!(
+                        call.request.context,
+                        json!({
+                            "task": expected_task,
+                            "candidates": ["a", "b", "c"],
+                            "comparison": {"capable": "a", "efficient": "b"},
+                            "evidence": settings.evidence,
+                        })
+                    );
+                    assert_eq!(call.request.questions.len(), 1);
+                    let question = &call.request.questions["route"];
+                    let switchyard_protocol::DecisionKind::Choice { options } = &question.kind
+                    else {
+                        panic!("expected a choice")
+                    };
+                    assert_eq!(
+                        options
+                            .iter()
+                            .map(|option| option.id.as_str())
+                            .collect::<Vec<_>>(),
+                        ["advantage", "no_advantage"]
+                    );
+                    if let Some(instructions) = override_instructions {
+                        assert_eq!(&question.instructions, instructions);
+                    } else {
+                        for key in ["setting", "evidence", "comparison", "boundary", "policy"] {
+                            assert!(question.instructions[key].as_str().is_some());
+                        }
+                    }
+                    if name == "provider error" {
+                        return call.respond(Err(LibsyError::client_call(
+                            "judge",
+                            LlmClientError::General("private provider body".into()),
+                        )));
+                    }
+                    if name == "dropped reply" {
+                        drop(call);
+                        return Ok(());
+                    }
+                    let value = if name == "wrong type" {
+                        DecisionValue::Boolean(BooleanEstimate::Value(true))
+                    } else {
+                        DecisionValue::Choice {
+                            selected: "no_advantage".into(),
+                            probabilities: (name != "no distribution").then(|| {
+                                BTreeMap::from([
+                                    ("advantage".into(), Probability(score)),
+                                    ("no_advantage".into(), Probability(1.0 - score)),
+                                ])
+                            }),
+                        }
+                    };
+                    let answers = if name == "missing answer" {
+                        BTreeMap::new()
+                    } else {
+                        BTreeMap::from([(
+                            "route".into(),
+                            DecisionAnswer {
+                                value,
+                                provider_confidence: Some(ProviderConfidence(0.99)),
+                            },
+                        )])
+                    };
+                    call.respond(Ok(DecisionResponse {
+                        id: None,
+                        model: Some("provider-judge".into()),
+                        answers,
+                        usage: Default::default(),
+                    }))
+                }
+            };
+            let models = Arc::new(RuntimeModels::new(runtime_models()));
+            let result = drive(router.clone(), request.clone(), models.clone(), &serve).await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(!matches!(name, "missing candidate" | "image limit")),
+                "{name}"
+            );
+            let Some(expected) = expected else {
+                if name == "image limit" {
+                    assert!(matches!(result, Err(LibsyError::InvalidRequest { .. })));
+                } else if name == "missing candidate" {
+                    assert!(
+                        matches!(result, Err(LibsyError::AlgorithmError { message }) if message.contains("candidate is missing"))
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(LibsyError::ClientCall { .. })),
+                        "{name}"
+                    );
+                }
+                continue;
+            };
+            let outcome = result?;
+            assert_eq!(outcome.selected_model_id()?, expected, "{name}");
+            assert!(outcome.response.is_none());
+            assert_eq!(outcome.request.llm_request.messages, original_messages);
+            let evidence = outcome
+                .metadata
+                .and_then(|metadata| metadata.evidence)
+                .expect("routing evidence");
+            if matches!(name, "above" | "equal" | "below") {
+                assert_eq!(evidence["source"], "decision_classifier");
+                assert_eq!(evidence["verdict"], "relative_advantage");
+                assert_eq!(evidence["threshold"], settings.cutoff);
+                assert_eq!(evidence["score"], score);
+            } else {
+                let reason = match name {
+                    "provider error" => "client_error",
+                    "dropped reply" => "call_error",
+                    _ => "invalid_verdict",
+                };
+                assert_eq!(
+                    evidence,
+                    json!({"source": "fail_open", "reason_code": reason})
+                );
+            }
+            let retained = drive(router, request.clone(), models, &serve).await?;
+            assert_eq!(retained.selected_model_id()?, expected);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "affinity should skip the judge: {name}"
+            );
+        }
+        for cutoff in [-0.1, 1.1, f64::NAN] {
+            let mut config = settings.clone();
+            config.cutoff = cutoff;
+            assert!(
+                LlmTaskClassifier::new(LlmClassifierConfig::Capability {
+                    config: TaskClassifierConfig {
+                        judge: CapabilityJudgeConfig::Decision(config),
+                        ..TaskClassifierConfig::default()
+                    },
+                })
+                .is_err()
+            );
+        }
+        let mut duplicate = settings.clone();
+        duplicate
+            .candidates
+            .insert("duplicate-a".into(), "capable".into());
+        assert!(duplicate.validate().is_err());
+        Ok(())
+    }
+
     #[test]
     fn the_threshold_boundary_is_inclusive() -> Result<()> {
         let policy = policy();
@@ -1374,8 +1665,8 @@ mod tests {
     #[test]
     fn the_threshold_moves_the_routing_boundary() -> Result<()> {
         let borderline = verdict(0.5, "supported", "SUP-1");
-        let strict = TaskClassifierPolicy::new(&test_config(0.9));
-        let lenient = TaskClassifierPolicy::new(&test_config(0.1));
+        let strict = TaskClassifierPolicy::new(&llm_config(0.9));
+        let lenient = TaskClassifierPolicy::new(&llm_config(0.1));
         assert_eq!(selected(&strict, Some(&borderline))?, "capable");
         assert_eq!(selected(&lenient, Some(&borderline))?, "efficient");
         Ok(())
@@ -1410,23 +1701,35 @@ mod tests {
         }
         for config in [
             TaskClassifierConfig {
-                base_threshold: 0.5,
-                threshold_step: -0.1,
+                judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                    base_threshold: 0.5,
+                    threshold_step: -0.1,
+                    ..LlmCapabilityConfig::default()
+                }),
                 ..TaskClassifierConfig::default()
             },
             TaskClassifierConfig {
-                base_threshold: 0.8,
-                threshold_step: 0.11,
+                judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                    base_threshold: 0.8,
+                    threshold_step: 0.11,
+                    ..LlmCapabilityConfig::default()
+                }),
                 ..TaskClassifierConfig::default()
             },
             TaskClassifierConfig {
-                base_threshold: 0.5,
+                judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                    base_threshold: 0.5,
+                    ..LlmCapabilityConfig::default()
+                }),
                 message_hash_fallback: true,
                 ..TaskClassifierConfig::default()
             },
             TaskClassifierConfig {
-                base_threshold: 0.5,
-                max_output_tokens: 0,
+                judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                    base_threshold: 0.5,
+                    max_output_tokens: 0,
+                    ..LlmCapabilityConfig::default()
+                }),
                 ..TaskClassifierConfig::default()
             },
         ] {
@@ -1437,6 +1740,46 @@ mod tests {
                 config: test_config(base_threshold),
             })?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn message_hash_fallback_accepts_retaining_triggers() -> Result<()> {
+        // Only `every_request` is rejected: it retains no target, so a fallback
+        // identity has nothing to key on. Both retaining triggers may key the
+        // retained target on a message hash when the caller sends no session id.
+        for trigger in [ClassifyTrigger::NewSession, ClassifyTrigger::UserTurn] {
+            let config = TaskClassifierConfig {
+                judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                    base_threshold: 0.5,
+                    ..LlmCapabilityConfig::default()
+                }),
+                classify_trigger: trigger,
+                message_hash_fallback: true,
+                ..TaskClassifierConfig::default()
+            };
+            LlmTaskClassifier::new(LlmClassifierConfig::Capability { config }).map_err(
+                |error| LibsyError::AlgorithmError {
+                    message: format!("{trigger:?} with message_hash_fallback rejected: {error}"),
+                },
+            )?;
+        }
+        let every_request = TaskClassifierConfig {
+            judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                base_threshold: 0.5,
+                ..LlmCapabilityConfig::default()
+            }),
+            classify_trigger: ClassifyTrigger::EveryRequest,
+            message_hash_fallback: true,
+            ..TaskClassifierConfig::default()
+        };
+        assert!(
+            LlmTaskClassifier::new(LlmClassifierConfig::Capability {
+                config: every_request
+            })
+            .is_err(),
+            "every_request with message_hash_fallback should stay rejected"
+        );
         Ok(())
     }
 
@@ -1468,9 +1811,9 @@ mod tests {
 
     #[test]
     fn capability_boundaries_apply_monotonic_threshold_steps() -> Result<()> {
-        let policy = TaskClassifierPolicy::new(&TaskClassifierConfig {
+        let policy = TaskClassifierPolicy::new(&LlmCapabilityConfig {
             threshold_step: 0.1,
-            ..test_config(0.4)
+            ..llm_config(0.4)
         });
 
         assert_eq!(

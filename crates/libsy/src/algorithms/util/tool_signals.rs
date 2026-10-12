@@ -12,11 +12,13 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
+use switchyard_protocol::codex_namespaces::{split_qualified_name, tool_namespaces};
 use switchyard_protocol::{ContentBlock, Request, Role, WireFormat};
 
 use crate::{LibsyError, Result};
@@ -78,9 +80,10 @@ static ERROR_PATTERNS: &[(&str, f32, &[&str])] = &[
         &[
             "filenotfounderror:",
             "no such file or directory",
-            // Claude Code Read-tool miss. Anchored as "file does not exist" (not a
-            // bare "does not exist", which fires on `ls` output and prose) — trace-
-            // mined across 1006 local trajectories at 22 true / 2 false positives.
+            // Claude Code's missing-file message. Reads are exempt (`is_missing_file`).
+            // Anchored as "file does not exist" (not a bare "does not exist", which
+            // fires on `ls` output and prose) — trace-mined across 1006 local
+            // trajectories at 22 true / 2 false positives.
             "file does not exist",
         ],
     ),
@@ -105,6 +108,9 @@ static EDIT_TOOL_NAMES: &[&str] = &[
     "text_editor",
     "patch", // hermes's str_replace-style edit tool
 ];
+
+/// Editor tools whose `command` argument picks the action. `view` only reads.
+static EDITOR_TOOL_NAMES: &[&str] = &["str_replace_based_edit_tool", "text_editor"];
 
 static WRITE_TOOL_NAMES: &[&str] = &["write", "create_file", "new_file", "write_file"];
 
@@ -182,11 +188,26 @@ static GIT_READ_SUBCOMMANDS: &[&str] = &[
     "tag",
 ];
 
-static READ_TOOL_NAMES: &[&str] = &["read", "view", "read_file", "search_files"];
+static READ_TOOL_NAMES: &[&str] = &[
+    "read",
+    "view",
+    "read_file",
+    "search_files",
+    "glob",
+    "grep",
+    "find",
+    "ls",
+];
 
 // Planning / scratchpad tool calls — investigative (non-producing) activity.
 // `update_plan` is codex's equivalent of `todowrite`.
-static PLAN_TOOL_NAMES: &[&str] = &["todowrite", "todo_write", "todo", "update_plan"];
+static PLAN_TOOL_NAMES: &[&str] = &[
+    "todowrite",
+    "todo_write",
+    "todo",
+    "update_plan",
+    "todo_list",
+];
 
 // Tool names that route through Bash-command pattern matching. `bash` is
 // claude-code's name; `shell_command` is codex's; `shell` / `local_shell_call`
@@ -199,6 +220,8 @@ static BASH_TOOL_NAMES: &[&str] = &[
     "local_shell_call",
     "terminal",
     "exec_command", // codex
+    "exec",         // openclaw
+    "powershell",   // pi on Windows
 ];
 
 // Prefer false negatives: tests_passed clears a capable hold, so a false positive
@@ -235,10 +258,11 @@ static NUMERIC_FAILURE_KEYWORDS: &[&str] = &["failed", "failure", "failures", "e
 /// passing a window to [`ToolSignals::from_request`].
 pub const DEFAULT_RECENT_WINDOW: usize = 3;
 
-/// Exact tool-name semantics added to the stage router's built-in vocabulary.
+/// Exact tool-name semantics added to the built-in vocabulary.
 ///
-/// Matching is ASCII case-insensitive. These lists are additive: built-in tool
-/// names cannot be reclassified.
+/// Matching is ASCII case-insensitive. An MCP or Codex namespaced tool also
+/// matches by its bare tool name. These lists are additive: built-in tool names
+/// cannot be reclassified.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolSemantics {
@@ -400,10 +424,14 @@ impl ToolSignals {
 }
 
 // `command` is the lowercased Bash command line; None for non-Bash tools.
+// `bare_name` is the tool's own name when `name` joins it to a namespace or MCP server.
+// `is_retrieval` marks a call that only reads; it counts as an observation.
 #[derive(Debug, Clone)]
-struct ObservedToolCall {
+struct ObservedToolCall<'a> {
     name: String,
+    bare_name: Option<&'a str>,
     command: Option<String>,
+    is_retrieval: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +499,9 @@ fn classify_tool_call_with_semantics(
     if WRITE_TOOL_NAMES.contains(&lower.as_str()) {
         return ToolSemantic::Mutate(MutationKind::Write);
     }
+    if EDITOR_TOOL_NAMES.contains(&lower.as_str()) && command == Some("view") {
+        return ToolSemantic::Observe;
+    }
     if EDIT_TOOL_NAMES.contains(&lower.as_str()) {
         return ToolSemantic::Mutate(MutationKind::Edit);
     }
@@ -507,6 +538,274 @@ fn classify_tool_call_with_semantics(
     semantics.classify(name).unwrap_or(ToolSemantic::Unknown)
 }
 
+/// Tools whose successful output is retrieved content or inspection data.
+fn is_retrieval_tool(name: &str, command: Option<&Value>) -> bool {
+    let lower = name.to_lowercase();
+    READ_TOOL_NAMES.contains(&lower.as_str())
+        || (EDITOR_TOOL_NAMES.contains(&lower.as_str())
+            && command
+                .and_then(Value::as_str)
+                .is_some_and(|command| command.eq_ignore_ascii_case("view")))
+        // PowerShell quoting and escapes do not follow the POSIX rules below.
+        || (lower != "powershell"
+            && BASH_TOOL_NAMES.contains(&lower.as_str())
+            && command.is_some_and(command_is_retrieval))
+}
+
+/// A shell command field given as one line or as argv words.
+fn command_is_retrieval(command: &Value) -> bool {
+    match command {
+        Value::String(line) => shell_is_retrieval(line, 0),
+        Value::Array(argv) => {
+            // Charge each word a separator byte, as in the one-line form, so the
+            // budget also bounds the argument count.
+            argv.iter()
+                .try_fold(0, |size, word| {
+                    let size = size + word.as_str()?.len() + 1;
+                    (size <= MAX_RETRIEVAL_COMMAND_BYTES).then_some(size)
+                })
+                .is_some()
+                && retrieval_command(
+                    &argv.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+                    0,
+                )
+        }
+        _ => false,
+    }
+}
+
+// Keep shell parsing bounded on the request thread. Larger commands retain
+// ordinary error scanning, just like unrecognized shell syntax.
+const MAX_RETRIEVAL_COMMAND_BYTES: usize = 16 * 1024;
+
+/// Only suppress output when every shell segment is a recognized inspection.
+/// Observation counters can count mixed commands; suppressing errors needs all
+/// commands to qualify. Substitutions and redirects keep their error signals.
+fn shell_is_retrieval(command: &str, depth: usize) -> bool {
+    if command.len() > MAX_RETRIEVAL_COMMAND_BYTES {
+        return false;
+    }
+    if quoted_chars(command).any(|(_, c, quote)| {
+        (quote != Some('\'') && matches!(c, '$' | '`'))
+            || (quote.is_none() && matches!(c, '<' | '>' | '(' | ')' | '{' | '}' | '#'))
+    }) {
+        return false;
+    }
+    let mut segments = shell_segments(command).peekable();
+    segments.peek().is_some()
+        && segments.all(|segment| {
+            // `split` also rejects an unclosed quote or a trailing backslash.
+            shlex::split(segment).is_some_and(|words| {
+                retrieval_command(&words.iter().map(String::as_str).collect::<Vec<_>>(), depth)
+            })
+        })
+}
+
+fn skip_shell_options<'a>(mut args: &'a [&'a str], takes_value: &[&str]) -> &'a [&'a str] {
+    while let Some((option, rest)) = args.split_first() {
+        if !option.starts_with('-') || *option == "-" {
+            break;
+        }
+        args = rest;
+        if *option == "--" {
+            break;
+        }
+        if takes_value.contains(option) {
+            args = args.get(1..).unwrap_or_default();
+        }
+    }
+    args
+}
+
+/// A short-option word such as `-Hx` that sets any of `flags`.
+fn has_short_flag(word: &str, flags: &[char]) -> bool {
+    word.starts_with('-') && !word.starts_with("--") && word.contains(flags)
+}
+
+// Bounds recursion through nested wrappers and `sh -c` scripts.
+const MAX_COMMAND_DEPTH: usize = 20;
+
+fn retrieval_command(mut words: &[&str], depth: usize) -> bool {
+    if depth > MAX_COMMAND_DEPTH {
+        return false;
+    }
+    while words.first().is_some_and(|word| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.bytes().enumerate().all(|(i, c)| {
+                    c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                })
+        })
+    }) {
+        words = &words[1..];
+    }
+    let Some((&program, args)) = words.split_first() else {
+        return false;
+    };
+    // The standard bin dirs hold the real programs. Any other path, such as
+    // `./test`, names a local script.
+    let program = [
+        "/bin/",
+        "/sbin/",
+        "/usr/bin/",
+        "/usr/sbin/",
+        "/usr/local/bin/",
+        "/opt/homebrew/bin/",
+    ]
+    .iter()
+    .find_map(|dir| program.strip_prefix(dir))
+    .unwrap_or(program);
+    // Unwrap launchers before inspecting the actual command and its flags.
+    let wrapper_options: Option<&[&str]> = match program {
+        "sudo" => Some(&[
+            "-u", "-g", "-h", "-p", "-C", "-T", "--user", "--group", "--host",
+        ]),
+        "env" => Some(&["-u", "--unset", "-C", "--chdir"]),
+        "command" | "nohup" => Some(&[]),
+        "exec" => Some(&["-a"]),
+        "time" => Some(&["-f", "--format", "-o", "--output"]),
+        "timeout" => Some(&["-s", "--signal", "-k", "--kill-after"]),
+        "xargs" => Some(&[
+            "-n",
+            "--max-args",
+            "-P",
+            "--max-procs",
+            "-I",
+            "--replace",
+            "-d",
+            "--delimiter",
+            "-L",
+            "--max-lines",
+            "-s",
+            "--max-chars",
+        ]),
+        _ => None,
+    };
+    if let Some(options) = wrapper_options {
+        // `env -S` splits its argument into a new command line.
+        if program == "env"
+            && args
+                .iter()
+                .any(|arg| arg.starts_with("--split-string") || has_short_flag(arg, &['S']))
+        {
+            return false;
+        }
+        let mut rest = skip_shell_options(args, options);
+        if program == "timeout" {
+            rest = rest.get(1..).unwrap_or_default();
+        }
+        return (program == "env" && rest.is_empty()) || retrieval_command(rest, depth + 1);
+    }
+    if matches!(program, "bash" | "sh" | "dash" | "zsh" | "ksh") {
+        return args
+            .first()
+            .is_some_and(|option| has_short_flag(option, &['c']))
+            && args
+                .get(1)
+                .is_some_and(|command| shell_is_retrieval(command, depth + 1));
+    }
+    if program == "git" {
+        return git_is_retrieval(args);
+    }
+    if matches!(args, ["--help" | "--version"]) {
+        return true;
+    }
+    match program {
+        "find" => !args.iter().any(|arg| {
+            matches!(
+                *arg,
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+            )
+        }),
+        // fd joins short flags, so `-Hx` runs a command too.
+        "fd" => !args
+            .iter()
+            .any(|arg| arg.starts_with("--exec") || has_short_flag(arg, &['x', 'X'])),
+        // Only the common line-range printing form; sed scripts can execute commands.
+        "sed" => {
+            args.len() >= 2
+                && args[0] == "-n"
+                && args[2..].iter().all(|arg| !arg.starts_with('-'))
+                && args[1].strip_suffix('p').is_some_and(|range| {
+                    !range.is_empty()
+                        && range
+                            .bytes()
+                            .all(|c| c.is_ascii_digit() || matches!(c, b',' | b'$'))
+                })
+        }
+        "sort" => !args.iter().any(|arg| {
+            arg.starts_with("--compress-program")
+                || arg.starts_with("--output")
+                || arg.starts_with("-o")
+        }),
+        "rg" => !args.iter().any(|arg| arg.starts_with("--pre")),
+        "xxd" => !args.contains(&"-r") && !args.contains(&"-revert"),
+        "go" => {
+            matches!(args.first(), Some(&"list" | &"doc" | &"env" | &"version"))
+                && !args.iter().any(|arg| matches!(*arg, "-w" | "-u"))
+        }
+        "docker" | "podman" => matches!(args.first(), Some(&"ps" | &"version")),
+        "cat" | "grep" | "ls" | "nl" | "head" | "tail" | "wc" | "pwd" | "stat" | "file" | "du"
+        | "df" | "which" | "type" | "diff" | "cmp" | "jq" | "uniq" | "cut" | "readlink"
+        | "realpath" | "tree" | "basename" | "dirname" | "printenv" | "echo" | "printf"
+        | "less" | "more" | "test" | "[" | "ps" | "pgrep" | "pkg-config" | "strings" | "uname"
+        | "od" | "true" | ":" | "cd" | "pstree" | "sha256sum" | "sha1sum" | "md5sum" | "lsof"
+        | "tr" | "free" | "id" | "namei" | "whoami" | "paste" | "ss" | "getent" => true,
+        _ => false,
+    }
+}
+
+fn git_is_retrieval(args: &[&str]) -> bool {
+    let args = skip_shell_options(
+        args,
+        &["-C", "-c", "--git-dir", "--work-tree", "--namespace"],
+    );
+    let Some((subcommand, rest)) = args.split_first() else {
+        return false;
+    };
+    match *subcommand {
+        "diff" => !rest.contains(&"--check"),
+        "branch" => {
+            rest.is_empty()
+                || rest.iter().all(|arg| {
+                    matches!(
+                        *arg,
+                        "-a" | "-r"
+                            | "--all"
+                            | "--list"
+                            | "--show-current"
+                            | "-v"
+                            | "-vv"
+                            | "--verbose"
+                    )
+                })
+        }
+        "remote" => {
+            rest.is_empty()
+                || matches!(rest, ["-v" | "--verbose"])
+                || rest.first() == Some(&"get-url")
+        }
+        "tag" => rest.is_empty() || matches!(rest[0], "-l" | "--list"),
+        "config" => matches!(
+            rest.first(),
+            Some(&"--get" | &"--get-all" | &"--list" | &"-l")
+        ),
+        "worktree" => rest.first() == Some(&"list"),
+        "submodule" => rest.first() == Some(&"status"),
+        "status" | "log" | "show" | "blame" | "ls-files" | "ls-remote" | "rev-parse"
+        | "merge-base" | "grep" | "describe" | "show-ref" | "check-ignore" | "rev-list"
+        | "ls-tree" | "diff-tree" | "version" => true,
+        _ => false,
+    }
+}
+
 fn is_builtin_tool_name(lower: &str) -> bool {
     WRITE_TOOL_NAMES.contains(&lower)
         || EDIT_TOOL_NAMES.contains(&lower)
@@ -519,41 +818,39 @@ fn is_builtin_tool_name(lower: &str) -> bool {
 /// pretending to be a full shell parser; only the leading program and flags of
 /// each segment are inspected below.
 fn shell_segments(command: &str) -> impl Iterator<Item = &str> {
-    let mut chars = command.char_indices();
-    let mut start = 0usize;
+    let mut start = 0;
+    quoted_chars(command)
+        .filter(|&(_, c, quote)| quote.is_none() && matches!(c, '\n' | ';' | '|' | '&'))
+        .map(|(index, _, _)| index)
+        .chain([command.len()])
+        .filter_map(move |end| {
+            let segment = command[start..end].trim();
+            // Separators are one byte.
+            start = end + 1;
+            (!segment.is_empty()).then_some(segment)
+        })
+}
+
+/// Unescaped characters with their byte index and the quote around them.
+fn quoted_chars(command: &str) -> impl Iterator<Item = (usize, char, Option<char>)> {
     let mut quote = None;
     let mut escaped = false;
-    let mut finished = false;
-
-    std::iter::from_fn(move || {
-        loop {
-            for (index, character) in chars.by_ref() {
-                if escaped {
-                    escaped = false;
-                } else if character == '\\' && quote != Some('\'') {
-                    escaped = true;
-                } else if quote == Some(character) {
-                    quote = None;
-                } else if quote.is_none() && matches!(character, '\'' | '"') {
-                    quote = Some(character);
-                } else if quote.is_none() && matches!(character, '\n' | ';' | '|' | '&') {
-                    let segment = command[start..index].trim();
-                    start = index + character.len_utf8();
-                    if !segment.is_empty() {
-                        return Some(segment);
-                    }
-                }
-            }
-
-            if finished {
-                return None;
-            }
-            finished = true;
-            let segment = command[start..].trim();
-            if !segment.is_empty() {
-                return Some(segment);
-            }
+    command.char_indices().filter_map(move |(index, c)| {
+        if escaped {
+            escaped = false;
+            return None;
         }
+        if c == '\\' && quote != Some('\'') {
+            escaped = true;
+            return None;
+        }
+        let around = quote;
+        if quote == Some(c) {
+            quote = None;
+        } else if quote.is_none() && matches!(c, '\'' | '"') {
+            quote = Some(c);
+        }
+        Some((index, c, around))
     })
 }
 
@@ -706,8 +1003,11 @@ fn extract_tool_signals_with_window_and_semantics(
 ) -> ToolSignals {
     // Read the decoded conversation, including preserved built-in tool outputs.
     let messages = &request.llm_request.messages;
+    let namespaces = tool_namespaces(&request.llm_request.extensions);
     let mut tool_texts: Vec<(String, bool)> = Vec::new();
     let mut tool_calls: Vec<ObservedToolCall> = Vec::new();
+    // IDs whose latest call is a retrieval tool.
+    let mut retrieval_calls: HashSet<&str> = HashSet::new();
     let mut compacted = false;
     let mut tool_result_count = 0usize;
     let mut assistant_turn_count = 0usize;
@@ -719,21 +1019,85 @@ fn extract_tool_signals_with_window_and_semantics(
         for block in &message.content {
             match block {
                 ContentBlock::ToolCall(call) => {
+                    // Responses namespaced tools arrive as `<namespace>__<tool>`.
+                    let bare_name = namespaces
+                        .and_then(|namespaces| split_qualified_name(namespaces, &call.name))
+                        .map(|(tool, _)| tool)
+                        .or_else(|| mcp_tool_name(&call.name));
+                    // The Responses wire format sends arguments as a JSON string.
+                    let decoded = call
+                        .arguments
+                        .as_str()
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+                    let command_field = command_of(decoded.as_ref().unwrap_or(&call.arguments));
+                    let command = command_field.and_then(command_text);
+                    // The joined name wins, as in `build_signal`. A joined name
+                    // configured as observe still counts when its bare name is a
+                    // retrieval tool, such as `mcp__files__read`.
+                    let full = classify_tool_call_with_semantics(
+                        &call.name,
+                        command.as_deref(),
+                        semantics,
+                    );
+                    let name = match (full, bare_name) {
+                        (ToolSemantic::Unknown | ToolSemantic::Observe, Some(bare_name)) => {
+                            bare_name
+                        }
+                        _ => call.name.as_str(),
+                    };
+                    let is_retrieval = is_retrieval_tool(name, command_field);
+                    if !call.id.is_empty() {
+                        // A reused ID links to its latest call.
+                        if is_retrieval {
+                            retrieval_calls.insert(call.id.as_str());
+                        } else {
+                            retrieval_calls.remove(call.id.as_str());
+                        }
+                    }
                     tool_calls.push(ObservedToolCall {
                         name: call.name.clone(),
-                        command: command_of(&call.arguments),
+                        bare_name,
+                        command,
+                        is_retrieval,
                     });
                 }
                 ContentBlock::ToolResult(result) => {
                     // Before the empty-text filter: empty results still count.
                     tool_result_count += 1;
+                    let is_error = result.is_error == Some(true);
                     let text = result
                         .content
                         .iter()
                         .filter_map(text_of)
                         .collect::<Vec<_>>()
                         .join("\n");
-                    let is_error = result.is_error == Some(true);
+                    let is_retrieval_result =
+                        retrieval_calls.contains(result.tool_call_id.as_str());
+                    if is_retrieval_result {
+                        // Shell reads can return bare JSON from a file. Hermes wraps
+                        // terminal output with output and exit_code fields.
+                        let shell_result = serde_json::Deserializer::from_str(&text)
+                            .into_iter::<Value>()
+                            .next()
+                            .and_then(|result| result.ok())
+                            .filter(|value| {
+                                value["output"].is_string() && value.get("exit_code").is_some()
+                            });
+                        let shell_failed = shell_result.as_ref().is_some_and(|value| {
+                            value["exit_code"].as_i64().is_some_and(|code| code != 0)
+                                || value["success"].as_bool() == Some(false)
+                                || value["error"]
+                                    .as_str()
+                                    .is_some_and(|error| !error.trim().is_empty())
+                        }) || has_nonzero_exit_status(&text.to_lowercase());
+                        if is_missing_file(&text) || (!is_error && !shell_failed) {
+                            // Keep the window slot after dropping retrieved content.
+                            if !text.is_empty() {
+                                tool_texts.push((String::new(), false));
+                            }
+                            continue;
+                        }
+                    }
                     // An explicit failure remains a signal even without text.
                     if !text.is_empty() || is_error {
                         tool_texts.push((text, is_error));
@@ -797,7 +1161,13 @@ fn extract_tool_signals_with_window_and_semantics(
                 // stays in the prefix on every later turn, so this self-latches
                 // once it fires.
                 ContentBlock::Text { text } => {
-                    compacted |= text.to_lowercase().contains(COMPACTION_MARKER);
+                    let text = text.to_lowercase();
+                    compacted |= text.contains(COMPACTION_MARKER)
+                        || text.lines().any(|line| {
+                            HERMES_COMPACTION_MARKERS
+                                .iter()
+                                .any(|marker| line.trim_start().starts_with(marker))
+                        });
                 }
                 _ => {}
             }
@@ -821,19 +1191,27 @@ fn extract_tool_signals_with_window_and_semantics(
 /// overflowed context. Matched case-insensitively; normal task text never contains it.
 const COMPACTION_MARKER: &str = "session is being continued";
 
-/// The shell command a tool call carries, when it has one. Harnesses name the
-/// field `command`; anything else is a tool whose category comes from its name.
-fn command_of(arguments: &Value) -> Option<String> {
-    // the Responses wire format sends arguments as a JSON string, not an object
-    let decoded = arguments
-        .as_str()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
-    let object = decoded.as_ref().unwrap_or(arguments);
+// Hermes can merge the summary into an existing message or restate an active task.
+const HERMES_COMPACTION_MARKERS: &[&str] = &[
+    "[context compaction \u{2014} reference only]",
+    "[still in progress \u{2014} this is the active request, restated after the compaction boundary",
+];
 
+/// The tool part of an `mcp__<server>__<tool>` name, the form Claude Code uses
+/// for MCP tools. The server name is assumed not to contain `__`; the tool name
+/// may.
+fn mcp_tool_name(name: &str) -> Option<&str> {
+    let (_server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
+    (!tool.is_empty()).then_some(tool)
+}
+
+/// The command field a tool call carries, when it has one. Harnesses name it
+/// `command`, `cmd` or `input`; anything else is a tool whose category comes
+/// from its name.
+fn command_of(arguments: &Value) -> Option<&Value> {
     ["command", "cmd", "input"]
         .iter()
-        .filter_map(|key| object.get(*key))
-        .find_map(command_text)
+        .find_map(|key| arguments.get(*key))
 }
 
 /// A command field as lowercase text, from a string or an argv array.
@@ -858,6 +1236,14 @@ fn text_of(block: &ContentBlock) -> Option<&str> {
         ContentBlock::Text { text } | ContentBlock::Refusal { text } => Some(text.as_str()),
         _ => None,
     }
+}
+
+/// Reads of missing paths happen as often on tasks that succeed as on tasks
+/// that fail, so they are not a failure signal.
+fn is_missing_file(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    // The OS error from shell tools, and Claude Code's Read tool message.
+    lower.contains("no such file or directory") || lower.contains("file does not exist")
 }
 
 fn build_signal(
@@ -908,7 +1294,19 @@ fn build_signal(
     let mut pure_bash_streak = 0u32;
     let mut streak_open = true;
     for (i, tc) in tool_calls.iter().enumerate().rev() {
-        let cat = classify_tool_call_with_semantics(&tc.name, tc.command.as_deref(), semantics);
+        // Every read, found or missed, is an observation. The read check parses
+        // the command, so it beats the substring patterns. Otherwise the joined
+        // name wins, so configs that list it keep working.
+        let mut cat = if tc.is_retrieval {
+            ToolSemantic::Observe
+        } else {
+            classify_tool_call_with_semantics(&tc.name, tc.command.as_deref(), semantics)
+        };
+        if matches!(cat, ToolSemantic::Unknown)
+            && let Some(bare_name) = tc.bare_name
+        {
+            cat = classify_tool_call_with_semantics(bare_name, tc.command.as_deref(), semantics);
+        }
         if streak_open {
             if matches!(cat, ToolSemantic::Unknown) {
                 pure_bash_streak += 1;
@@ -1005,7 +1403,7 @@ fn content_to_text(content: Option<&Value>) -> Option<String> {
     }
 }
 
-/// Match `text` against the error pattern table.
+/// Match tool text and structured result fields against error patterns.
 ///
 /// Returns `(max_severity, matched_pattern_names)`.
 pub(crate) fn classify_text(text: &str) -> (f32, Vec<String>) {
@@ -1018,11 +1416,25 @@ pub(crate) fn classify_text(text: &str) -> (f32, Vec<String>) {
             severity = severity.max(*sev);
         }
     }
-    if has_nonzero_exit_status(&lower) && !patterns.iter().any(|p| p == "exit_nonzero") {
+    // Hermes can append a loop warning after the JSON result.
+    let result = serde_json::Deserializer::from_str(text)
+        .into_iter::<Value>()
+        .next()
+        .and_then(|result| result.ok())
+        .unwrap_or_default();
+    let nonzero_exit = result["exit_code"].as_i64().is_some_and(|code| code != 0);
+    let tool_error = result["success"].as_bool() == Some(false)
+        || result["error"]
+            .as_str()
+            .is_some_and(|error| !error.trim().is_empty());
+    if (nonzero_exit || has_nonzero_exit_status(&lower))
+        && !patterns.iter().any(|p| p == "exit_nonzero")
+    {
         patterns.push("exit_nonzero".to_string());
         severity = severity.max(SOFT);
     }
     for (name, matched) in [
+        ("tool_error", tool_error),
         ("compile_error", has_compiler_diagnostic(&lower)),
         ("runtime_exception", has_runtime_exception(&lower)),
         ("runtime_panic", has_runtime_panic(&lower)),
@@ -1252,6 +1664,7 @@ mod tests {
     use super::*;
     use crate::algorithms::util::stage::score_signal;
     use serde_json::json;
+    use switchyard_protocol::codex_namespaces::TOOL_NAMESPACES_KEY;
     use switchyard_protocol::{
         ContentBlock, LlmRequest, Message, Metadata, Role, ToolCall, ToolResult,
     };
@@ -1310,6 +1723,34 @@ mod tests {
         let (sev, patterns) = classify_text("everything went fine");
         assert_eq!(sev, 0.0);
         assert!(patterns.is_empty());
+    }
+
+    #[test]
+    fn structured_tool_failures_affect_recovery_signals() {
+        for (text, severity) in [
+            (r#"{"output":"","exit_code":7,"error":null}"#, SOFT),
+            (r#"{"output":"","exit_code":-1,"error":null}"#, SOFT),
+            (r#"{"success":false,"error":"No matching text"}"#, HARD),
+            (r#"{"success":false,"error":null}"#, HARD),
+            (
+                r#"{"error":"Overwrite refused","stale_write_blocked":true}"#,
+                HARD,
+            ),
+            (r#"{"output":"out of memory","exit_code":1}"#, CRITICAL),
+            (r#"{"output":"done","exit_code":0,"error":null}"#, 0.0),
+            (r#"{"success":true,"error":"  "}"#, 0.0),
+            (r#"{"output":"running","exit_code":null,"error":null}"#, 0.0),
+            (r#"{"output":{"success":false},"exit_code":0}"#, 0.0),
+        ] {
+            let warned = format!("{text}\n\n[Tool loop warning: repeated identical call]");
+            let request = with_messages(vec![tr("5 passed in 0.12s"), tr(text), tr(&warned)]);
+            let signal = ToolSignals::from_request(&request, None);
+            let clean = severity == 0.0;
+            assert_eq!(signal.severity, severity, "{text}");
+            assert_eq!(signal.no_error_streak, if clean { 3 } else { 0 }, "{text}");
+            assert_eq!(signal.repeated_failure, severity >= HARD, "{text}");
+            assert_eq!(signal.tests_passed, clean, "{text}");
+        }
     }
 
     #[test]
@@ -1519,6 +1960,173 @@ mod tests {
             ],
             DEFAULT_RECENT_WINDOW
         ));
+    }
+
+    #[test]
+    fn retrieved_file_contents_are_ignored() {
+        let call = |id: &str, name: &str, arguments: Value| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments,
+            })],
+        };
+        let result = |id: &str, text: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult(ToolResult {
+                tool_call_id: id.to_string(),
+                content: vec![ContentBlock::Text {
+                    text: text.to_string(),
+                }],
+                is_error: None,
+            })],
+        };
+        let signal = extract_tool_signals_with_window(
+            &with_messages(vec![
+                call("a", "Bash", json!({"command": "pytest"})),
+                result("a", "Traceback (most recent call last):\nValueError"),
+                call("b", "Read", json!({"file_path": "notes.md"})),
+                result(
+                    "b",
+                    r#"{"success":false,"error":"out of memory","exit_code":7}"#,
+                ),
+                call("c", "Grep", json!({"pattern": "passed"})),
+                result("c", "CHANGELOG.md: all tests passed"),
+            ]),
+            DEFAULT_RECENT_WINDOW,
+        );
+        // Only the real pytest run counts.
+        assert_eq!(signal.severity, HARD);
+        assert!(!signal.tests_passed);
+        assert_eq!(signal.tool_result_count, 3);
+
+        for (command, text, severity) in [
+            ("cat config.json", r#"{"error":"fixture data"}"#, 0.0),
+            (
+                "cat missing.json",
+                r#"{"output":"","exit_code":7,"error":null}"#,
+                SOFT,
+            ),
+            (
+                "cat config.json && python check.py",
+                r#"{"error":"check rejected"}"#,
+                HARD,
+            ),
+        ] {
+            let request = with_messages(vec![
+                call("shell", "Bash", json!({"command": command})),
+                result("shell", text),
+            ]);
+            assert_eq!(
+                ToolSignals::from_request(&request, None).severity,
+                severity,
+                "{text}"
+            );
+        }
+    }
+
+    // A request whose tool result answers the tool call.
+    fn call_with_result(mut call: Message, mut result: Message) -> Request {
+        if let ContentBlock::ToolCall(call) = &mut call.content[0] {
+            call.id = "call-1".into();
+        }
+        if let ContentBlock::ToolResult(result) = &mut result.content[0] {
+            result.tool_call_id = "call-1".into();
+        }
+        with_messages(vec![call, result])
+    }
+
+    #[test]
+    fn shell_reads_are_ignored_but_keep_their_window_slot() {
+        for command in [
+            "/usr/bin/cat logfile.txt",
+            "cd /repo && tail -n 100 logfile.txt | grep MemoryError",
+            "env MODE=debug timeout 5s rg 'MemoryError' .",
+        ] {
+            let mut request = call_with_result(bash(command), tr("MemoryError\nall tests passed"));
+            request.llm_request.messages.splice(
+                0..0,
+                [bash("pytest"), tr("Traceback (most recent call last):")],
+            );
+            // The read adds no error and no test pass, so the earlier failure stands.
+            let signal = ToolSignals::from_request(&request, Some(2));
+            assert_eq!(signal.severity, HARD, "{command}");
+            assert!(!signal.tests_passed, "{command}");
+            // The read still fills a window slot, so the failure can age out.
+            let signal = ToolSignals::from_request(&request, Some(1));
+            assert_eq!(signal.severity, 0.0, "{command}");
+        }
+    }
+
+    #[test]
+    fn shell_commands_that_run_code_keep_signals() {
+        let oversized = format!("cat {}", "a".repeat(MAX_RETRIEVAL_COMMAND_BYTES));
+        for command in [
+            "cat logfile.txt; pytest",
+            "echo $(pytest)",
+            "find . -name '*.py' -exec pytest ';'",
+            oversized.as_str(),
+        ] {
+            let request = call_with_result(bash(command), tr("MemoryError"));
+            let signal = ToolSignals::from_request(&request, None);
+            assert_eq!(signal.severity, CRITICAL, "{command}");
+        }
+    }
+
+    #[test]
+    fn failed_reads_signal_unless_the_file_is_missing() {
+        let failed = |text: &str| {
+            let mut result = tr(text);
+            if let ContentBlock::ToolResult(result) = &mut result.content[0] {
+                result.is_error = Some(true);
+            }
+            result
+        };
+        let missing = "missing.txt: No such file or directory";
+        let severities = [
+            call_with_result(bash("cat missing.txt"), failed(missing)),
+            call_with_result(tc("Read"), failed("File does not exist.")),
+            // A read that fails for another reason still counts.
+            call_with_result(bash("cat logfile.txt"), failed("MemoryError")),
+            // Only reads are exempt.
+            call_with_result(bash("python missing.txt"), failed(missing)),
+        ]
+        .map(|request| ToolSignals::from_request(&request, None).severity);
+        assert_eq!(severities, [0.0, 0.0, CRITICAL, HARD]);
+
+        let request = call_with_result(
+            bash("cat missing.json"),
+            tr(r#"{"output":"No such file or directory","exit_code":1}"#),
+        );
+        assert_eq!(ToolSignals::from_request(&request, None).severity, 0.0);
+    }
+
+    #[test]
+    fn argv_commands_keep_word_boundaries() {
+        let signal = |argv: Value| {
+            let call = exec_command(json!({"cmd": argv}));
+            ToolSignals::from_request(&call_with_result(call, tr("MemoryError")), None)
+        };
+        let mut many_args = vec![""; MAX_RETRIEVAL_COMMAND_BYTES];
+        many_args[0] = "cat";
+        let severities = [
+            json!(["bash", "-lc", "cd repo && rg foo"]),
+            json!(["bash", "-lc", "cat log; pytest"]),
+            // One argv word is one file name, even with a separator in it.
+            json!(["cat", "log; pytest"]),
+            // Over the byte budget, by size and by argument count.
+            json!(["cat", "a".repeat(MAX_RETRIEVAL_COMMAND_BYTES)]),
+            json!(many_args),
+        ]
+        .map(|argv| signal(argv).severity);
+        assert_eq!(severities, [0.0, CRITICAL, 0.0, CRITICAL, CRITICAL]);
+        // A read is an observation, even as a whole `-lc` script.
+        let read = signal(json!(["bash", "-lc", "sed -n 1,200p x"]));
+        assert_eq!(read.read_count, 1);
+        // Other commands are counted inside the script too.
+        let write = signal(json!(["bash", "-lc", "cd repo && mkdir x"]));
+        assert_eq!(write.write_count, 1);
     }
 
     #[test]
@@ -1835,6 +2443,41 @@ mod tests {
     }
 
     #[test]
+    fn hermes_compaction_headers_set_compacted() {
+        for header in [
+            "[CONTEXT COMPACTION \u{2014} REFERENCE ONLY] Earlier turns were compacted into the summary below.",
+            "[STILL IN PROGRESS \u{2014} this is the active request, restated after the compaction boundary because it was not finished yet. Continue it\u{3b} do not start over.]",
+        ] {
+            for role in [Role::User, Role::Assistant] {
+                let request = with_messages(vec![
+                    Message::text(role, format!("{header}\nContinue the task.")),
+                    bash("ls"),
+                ]);
+                assert!(ToolSignals::from_request(&request, None).compacted);
+            }
+            let request = with_messages(vec![Message::text(
+                Role::User,
+                format!("Prior context.\n\n  {header}\nContinue the task."),
+            )]);
+            assert!(ToolSignals::from_request(&request, None).compacted);
+            let request = with_messages(vec![tr(header)]);
+            assert!(!ToolSignals::from_request(&request, None).compacted);
+        }
+    }
+
+    #[test]
+    fn ordinary_compaction_text_stays_uncompacted() {
+        for text in [
+            "The task is still in progress after the compaction boundary.",
+            "Explain [CONTEXT COMPACTION \u{2014} REFERENCE ONLY] in the docs.",
+            "[STILL IN PROGRESS] Continue the task.",
+        ] {
+            let request = with_messages(vec![Message::text(Role::User, text)]);
+            assert!(!ToolSignals::from_request(&request, None).compacted);
+        }
+    }
+
+    #[test]
     fn codex_compaction_metadata_stays_on_parent_route() {
         let mut request = with_messages(vec![bash("ls")]);
         request.metadata = Some(Metadata {
@@ -2006,6 +2649,49 @@ mod tests {
             classify_tool_call("shell_command", Some("./run_tests.sh")),
             ToolSemantic::Unknown,
         );
+    }
+
+    #[test]
+    fn text_editor_view_is_a_read() {
+        for name in ["str_replace_based_edit_tool", "text_editor"] {
+            assert_eq!(
+                classify_tool_call(name, Some("view")),
+                ToolSemantic::Observe
+            );
+            for command in [
+                Some("create"),
+                Some("insert"),
+                Some("str_replace"),
+                Some("undo_edit"),
+                None,
+            ] {
+                assert_eq!(
+                    classify_tool_call(name, command),
+                    ToolSemantic::Mutate(MutationKind::Edit),
+                );
+            }
+        }
+
+        let arguments = [
+            json!({"command": "view", "path": "/app/main.py"}),
+            // the Responses wire format sends arguments as a JSON string
+            json!(r#"{"command":"view","path":"/app/main.py"}"#),
+        ];
+        for arguments in arguments {
+            let call = Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: String::new(),
+                    name: "str_replace_based_edit_tool".to_string(),
+                    arguments,
+                })],
+            };
+            let request = with_messages(vec![call, tr("print('hi')")]);
+            let sig = ToolSignals::from_request(&request, None);
+            assert_eq!(sig.read_count, 1);
+            assert_eq!(sig.recent_read_count, 1);
+            assert_eq!(sig.edit_count, 0);
+        }
     }
 
     #[test]
@@ -2246,6 +2932,30 @@ mod tests {
         assert_eq!(signal.new_count, 1);
         assert_eq!(signal.recent_new_count, 1);
         assert_eq!(signal.pure_bash_streak, 1);
+    }
+
+    #[test]
+    fn configured_tool_semantics_match_namespaced_and_mcp_tools() {
+        // The Responses decoder flattens namespaced tools and records the mapping.
+        let mut request = with_messages(vec![tc("mcp__billing__send_payment_request")]);
+        request.llm_request.extensions.fields.insert(
+            TOOL_NAMESPACES_KEY.to_string(),
+            json!({"mcp__billing__send_payment_request": "mcp__billing"}),
+        );
+
+        // Claude Code sends MCP tools flat, with no namespace mapping.
+        let claude_request = with_messages(vec![tc("mcp__billing__send_payment_request")]);
+
+        for request in [&request, &claude_request] {
+            for name in ["send_payment_request", "mcp__billing__send_payment_request"] {
+                let semantics = ToolSemantics {
+                    mutate: vec![name.to_string()],
+                    ..Default::default()
+                };
+                let signal = ToolSignals::from_request_with_semantics(request, None, &semantics);
+                assert_eq!(signal.write_count, 1, "{name}");
+            }
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 //! Integration tests for the libsy Rust server.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::io::Write;
@@ -409,7 +409,8 @@ async fn upstream_chat(
         .pointer("/response_format/json_schema/schema/properties/escalate")
         .is_some()
     {
-        r#"{"escalate":false,"reason":"making progress"}"#.to_string()
+        r#"{"escalate":false,"category":"none","new_evidence":false,"reason":"making progress"}"#
+            .to_string()
     } else if model == "model/classifier" && requests_schema_invalid_verdict {
         r#"{"crux":"bounded task","primary_rule":"SUP-1","capability_boundary":"supported","p_solve":0.1,"unexpected":true}"#.to_string()
     } else if model == "model/classifier" {
@@ -598,7 +599,12 @@ async fn upstream_responses_silo(
             .get("escalate")
             .is_some()
         {
-            json!({"escalate": strong, "reason": "state probe"})
+            json!({
+                "escalate": strong,
+                "category": if strong { "capability_gap" } else { "none" },
+                "new_evidence": strong,
+                "reason": "state probe",
+            })
         } else {
             json!({
                 "crux": "state probe", "primary_rule": if strong { "LIM-1" } else { "SUP-1" },
@@ -749,8 +755,10 @@ fn random_state_with_retries(
         forward_auth: false,
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),
+        omit_body_fields: BTreeSet::new(),
         reasoning_effort: None,
         max_retries,
+        failure_cooldown: std::time::Duration::ZERO,
         timeout: None,
     });
     let target_models = routes
@@ -1351,6 +1359,8 @@ schema_version = 1
 format = "openai_chat"
 base_url = "{base_url}"
 max_retries = 0
+# Exercise upstream fallback on every request.
+failure_cooldown_ms = 0
 
 [targets.first]
 id = "{first}"
@@ -2495,85 +2505,73 @@ async fn classifier_image_limits_preserve_answer_images() -> TestResult {
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,bmV3", "detail": "high"}}
     ]);
     for custom in [false, true] {
-        for limit in [None, Some(0), Some(1)] {
-            for invalid in [false, true] {
-                if invalid && !custom {
-                    continue;
-                }
-                let mode = if custom {
-                    r#"mode = "custom"
+        for limit in [None, Some(0), Some(1), Some(2)] {
+            let mode = if custom {
+                r#"mode = "custom"
 models = { judge = ["classifier"], weak = ["weak"], premium = ["premium"], any = ["weak", "premium"] }
 default_target = "weak"
 response_schema = '{"type":"object","properties":{"decision":{"type":"object","properties":{"target":{"type":"string","enum":["weak","premium"]}},"required":["target"],"additionalProperties":false}},"required":["decision"],"additionalProperties":false}'
 policy = { type = "target_selector", selector = "/decision/target" }"#
-                } else {
-                    "mode = \"capability\"\nclassifier_target = \"classifier\"\nstrong_target = \"premium\"\nweak_target = \"weak\"\nbase_threshold = 0.5"
-                };
-                let limit_config = limit
-                    .map(|n| format!("judge_max_images = {n}"))
-                    .unwrap_or_default();
-                let prompt = if invalid {
-                    "return an invalid verdict"
-                } else {
-                    "route to premium"
-                };
-                let state = load_test_config(&format!(
-                    r#"
+            } else {
+                "mode = \"capability\"\nclassifier_target = \"classifier\"\nstrong_target = \"premium\"\nweak_target = \"weak\"\nbase_threshold = 0.5"
+            };
+            let limit_config = limit
+                .map(|n| format!("judge_max_images = {n}"))
+                .unwrap_or_default();
+            let state = load_test_config(&format!(
+                r#"
 schema_version = 1
 [llm_clients.upstream]
 format = "openai_chat"
 base_url = "{}"
-[targets.classifier]
-id = "model/classifier"
-llm_client = "upstream"
-[targets.weak]
-id = "model/weak"
-llm_client = "upstream"
-[targets.premium]
-id = "model/premium"
-llm_client = "upstream"
+[targets]
+classifier = {{ id = "model/classifier", llm_client = "upstream" }}
+weak = {{ id = "model/weak", llm_client = "upstream" }}
+premium = {{ id = "model/premium", llm_client = "upstream" }}
 [routes.vision]
 id = "vision"
 type = "llm_classifier"
-prompt = "{prompt}"
+prompt = "route to premium"
 {mode}
 {limit_config}
 "#,
-                    upstream.base_url
-                ))?;
-                let app = build_switchyard_router(state);
-                upstream.calls.lock().await.clear();
-                let response = send(
-                    &app,
-                    "POST",
-                    "/v1/chat/completions",
-                    Some(json!({
-                        "model": "vision", "messages": [{"role": "user", "content": images}]
-                    })),
-                )
-                .await?;
-                assert_eq!(response.status, StatusCode::OK);
-                let calls = upstream.calls.lock().await;
-                assert_eq!(calls.len(), 2);
-                assert_eq!(calls[0]["model"], "model/classifier");
-                let judge = calls[0]["messages"][1]["content"].to_string();
-                assert!(judge.contains("Compare these images."));
-                assert_eq!(
-                    judge.matches("image_url").count(),
-                    limit.unwrap_or(2).min(2) * 2
+                upstream.base_url
+            ))?;
+            let app = build_switchyard_router(state);
+            upstream.calls.lock().await.clear();
+            let response = send(
+                &app,
+                "POST",
+                "/v1/chat/completions",
+                Some(json!({
+                    "model": "vision", "messages": [{"role": "user", "content": images}]
+                })),
+            )
+            .await?;
+            let calls = upstream.calls.lock().await;
+            if limit == Some(1) {
+                assert_eq!(response.status, StatusCode::BAD_REQUEST);
+                assert!(
+                    response.json()?["error"]["message"]
+                        .to_string()
+                        .contains("exceeding judge_max_images = 1")
                 );
-                assert_eq!(judge.contains("bmV3"), limit != Some(0));
-                assert_eq!(judge.contains("b2xk"), limit.is_none());
-                assert_eq!(calls[1]["messages"][0]["content"], images);
-                assert_eq!(
-                    calls[1]["model"],
-                    if custom && !invalid {
-                        "model/premium"
-                    } else {
-                        "model/weak"
-                    }
-                );
+                assert!(calls.is_empty());
+                continue;
             }
+            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0]["model"], "model/classifier");
+            let judge = &calls[0]["messages"][1]["content"];
+            if limit == Some(0) {
+                assert_eq!(
+                    judge,
+                    "Compare these images.\n[Image omitted from judge input.]\n[Image omitted from judge input.]"
+                );
+            } else {
+                assert_eq!(judge, &images);
+            }
+            assert_eq!(calls[1]["messages"][0]["content"], images);
         }
     }
     Ok(())
@@ -3367,6 +3365,102 @@ target = "openai"
     Ok(())
 }
 
+/// Serves `/v1/responses` and `/v1/messages` for a stub gateway on one host and records the
+/// path and `authorization` values of each call. `/v1/responses` calls get a judge verdict.
+async fn upstream_gateway_records_auth(
+    State(calls): State<Arc<Mutex<Vec<Value>>>>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> HttpResponse {
+    let authorization: Vec<_> = headers
+        .get_all("authorization")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    calls
+        .lock()
+        .await
+        .push(json!({"path": uri.path(), "authorization": authorization}));
+    let model = body["model"].as_str().unwrap_or_default();
+    if uri.path() == "/v1/responses" {
+        let verdict = json!({
+            "crux": "bounded task", "primary_rule": "SUP-1",
+            "capability_boundary": "supported", "p_solve": 0.9,
+        });
+        return Json(responses_body("resp_judge", model, &verdict.to_string())).into_response();
+    }
+    Json(json!({
+        "id": "msg_gateway", "type": "message", "role": "assistant", "model": model,
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    }))
+    .into_response()
+}
+
+/// A route that mixes formats on one gateway forwards the caller's bearer token to both of the
+/// gateway's APIs: `/v1/responses` for the judge and `/v1/messages` for the answer.
+#[tokio::test]
+async fn route_on_one_host_forwards_the_bearer_token_to_responses_and_messages() -> TestResult {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let gateway = Router::new()
+        .route("/v1/responses", post(upstream_gateway_records_auth))
+        .route("/v1/messages", post(upstream_gateway_records_auth))
+        .with_state(Arc::clone(&calls));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let host = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move { axum::serve(listener, gateway).await });
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.gateway_responses]
+format = "openai_responses"
+base_url = "{host}/v1"
+forward_auth = true
+max_retries = 0
+
+[llm_clients.gateway_messages]
+format = "anthropic_messages"
+base_url = "{host}"
+forward_auth = true
+max_retries = 0
+
+[targets]
+judge = {{ id = "model/judge", llm_client = "gateway_responses" }}
+capable = {{ id = "model/capable", llm_client = "gateway_messages" }}
+efficient = {{ id = "model/efficient", llm_client = "gateway_messages" }}
+
+[routes.agent]
+id = "switchyard/agent"
+type = "composite"
+classifier = {{ target = "judge", base_threshold = 0.5, classify_trigger = "user_turn" }}
+stage = {{ capable_target = "capable", efficient_target = "efficient", confidence_threshold = 0.5 }}
+"#
+    ))?;
+
+    let response = send_with_headers(
+        &build_switchyard_router(state),
+        "POST",
+        "/v1/responses",
+        Some(json!({"model": "switchyard/agent", "input": "hi there"})),
+        &[("authorization", "Bearer gateway-key")],
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text()?);
+
+    // The judge call and the answer call each carry the caller's bearer token once, unchanged.
+    assert_eq!(
+        *calls.lock().await,
+        [
+            json!({"path": "/v1/responses", "authorization": ["Bearer gateway-key"]}),
+            json!({"path": "/v1/messages", "authorization": ["Bearer gateway-key"]}),
+        ]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn routes_dispatch_and_discovery_endpoints_are_stable() -> TestResult {
     let (upstream, app) = test_app(&[
@@ -3526,21 +3620,22 @@ target = "shared"
     assert_eq!(models.status, StatusCode::OK);
     let body = models.json()?;
     let data = body["data"].as_array().cloned().unwrap_or_default();
-    let capabilities = data
+    let entries = data
         .iter()
-        .filter_map(|entry| entry["id"].as_str().map(|id| (id, &entry["capabilities"])))
+        .filter_map(|entry| entry["id"].as_str().map(|id| (id, entry)))
         .collect::<BTreeMap<_, _>>();
+    let capabilities = |id: &str| &entries[id]["capabilities"];
 
-    assert_eq!(capabilities["declared"]["context_window"], json!(1_000_000));
-    assert_eq!(capabilities["declared"]["tool_calling"], json!(true));
-    assert_eq!(capabilities["restricted"]["context_window"], json!(262_000));
-    assert_eq!(capabilities["restricted"]["tool_calling"], json!(false));
-    assert_eq!(capabilities["undeclared"]["context_window"], json!(null));
-    assert_eq!(capabilities["undeclared"]["tool_calling"], json!(null));
+    assert_eq!(entries["declared"]["context_length"], json!(1_000_000));
+    assert_eq!(capabilities("declared")["tool_calling"], json!(true));
+    assert_eq!(entries["restricted"]["context_length"], json!(262_000));
+    assert_eq!(capabilities("restricted")["tool_calling"], json!(false));
+    assert_eq!(entries["undeclared"]["context_length"], json!(null));
+    assert_eq!(capabilities("undeclared")["tool_calling"], json!(null));
 
-    assert_eq!(capabilities["declared"]["vision"], json!(true));
-    assert_eq!(capabilities["restricted"]["vision"], json!(false));
-    assert_eq!(capabilities["undeclared"]["vision"], json!(null));
+    assert_eq!(capabilities("declared")["vision"], json!(true));
+    assert_eq!(capabilities("restricted")["vision"], json!(false));
+    assert_eq!(capabilities("undeclared")["vision"], json!(null));
     assert_eq!(body["models"], json!([]));
 
     Ok(())
@@ -5063,7 +5158,7 @@ async fn advisor_route_redo_client_error_and_stats_projection() -> TestResult {
     assert!(feedback.starts_with("A senior reviewer examined your work"));
     assert!(feedback.ends_with("run the tests"));
 
-    // A failed HTTP advisor call stops the request before the algorithm can approve it.
+    // Fail-open returns the buffered executor turn when the HTTP advisor call fails.
     let response = send_with_headers(
         &app,
         "POST",
@@ -5072,8 +5167,8 @@ async fn advisor_route_redo_client_error_and_stats_projection() -> TestResult {
         &[("proxy_x_session_id", "fail-flow")],
     )
     .await?;
-    assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.json()?["error"]["type"], "upstream_error");
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json()?["choices"][0]["message"]["content"], "ok");
     assert_eq!(
         upstream.models().await,
         [
@@ -5086,8 +5181,8 @@ async fn advisor_route_redo_client_error_and_stats_projection() -> TestResult {
     );
 
     let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
-    // Only the successful redo request returns an executor answer.
-    assert_eq!(stats["models"]["model/executor"]["calls"], 1);
+    // Both requests return an executor answer.
+    assert_eq!(stats["models"]["model/executor"]["calls"], 2);
     assert_eq!(stats["classifier"]["total_errors"], 1);
     // Projection deltas for the metrics only this test emits.
     let redo = gate_count(&stats, &["reviews", "redo", "total"])
@@ -5114,10 +5209,9 @@ async fn advisor_route_redo_client_error_and_stats_projection() -> TestResult {
         gate_count(&stats, &["discarded", "tokens", "output"]),
         gate_count(&before, &["discarded", "tokens", "output"]) + 2
     );
-    // The host stops before the algorithm records a fail-open advisor decision.
     assert_eq!(
         gate_count(&stats, &["consult_failures", "upstream_5xx"]),
-        gate_count(&before, &["consult_failures", "upstream_5xx"])
+        gate_count(&before, &["consult_failures", "upstream_5xx"]) + 1
     );
 
     // Reset re-baselines the projection: the redo/discard counts this test

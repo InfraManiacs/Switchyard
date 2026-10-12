@@ -13,8 +13,6 @@ This example uses the packaged classifier prompt as intended: it estimates
 whether the weak target can complete the task, and keeps the first routing
 decision for later requests in the same conversation.
 
-> Requires unreleased features. [Build from source](../getting_started.md#build-from-source) to run this example.
-
 ```toml
 schema_version = 1
 
@@ -122,9 +120,9 @@ for the server merge behavior.
 | `base_threshold` | required | Lowest `p_solve` that routes a supported task to `weak_target`. Must be between `0` and `1`. |
 | `threshold_step` | `0.0` | Amount added for each boundary step. Must be finite and non-negative, and `base_threshold + 2 * threshold_step` must not exceed `1`. |
 | `recent_turn_window` | unset | When unset, the judge sees the opening user task and the latest user message when they differ. When set to `N`, it sees the opening user task and the last `N` conversation messages after that task. `0` keeps only the opening task. Client system and developer instructions are not shown to the judge. |
-| `judge_max_images` | unset | Capability/custom modes: omit to preserve all images in the selected messages; `0` excludes images from the judge; `N` keeps the newest `N` images in their original order, including images in tool results. The answer request is unchanged. |
+| `judge_max_images` | unset | Capability/custom modes: omit to preserve all images in the selected messages; `0` excludes images from the judge; `N > 0` rejects judge input exceeding `N` images, including images in tool results. Accepted images keep their original order. The answer request is unchanged. |
 | `classify_trigger` | `every_request` | When the judge runs. `every_request` judges every request, tool continuations included. `user_turn` judges each new user message and holds that target across the tool calls between. `new_session` judges once and reuses that target for the session. |
-| `message_hash_fallback` | `false` | When session metadata is absent, keys affinity from the first user-message text. Requires `classify_trigger = "new_session"`. |
+| `message_hash_fallback` | `false` | When session metadata is absent, keys affinity from the first user-message text. Requires `classify_trigger = "new_session"` or `"user_turn"`. |
 | `prompt` | packaged capability prompt | Replaces the classifier's system prompt. The packaged verdict schema and routing policy remain active. |
 | `response_format_type` | `json_schema` | Structured-output mode for capability and escalation judges. Use `json_object` for providers without JSON Schema support. |
 | `max_output_tokens` | `4096` | Maximum completion tokens available to the classifier verdict. Must be at least `1`. |
@@ -138,21 +136,22 @@ the judge. `judge_max_images` controls how many of those images the judge receiv
 judge_max_images = 0  # Text-only judge; the answer model still receives all images.
 ```
 
-Set `judge_max_images = 1` to show the judge the newest image, or omit the field
-to retain all images in the messages selected by `recent_turn_window`. The limit
-is shared across those messages and nested tool results. Omitted images become
-text markers, so image-only messages remain valid and their positions are visible.
-The remaining images keep their original order, URLs/data, and detail settings.
-Switchyard does not fetch or resize images for this limit.
+Set `judge_max_images = 2` to allow at most two images in the messages selected
+by `recent_turn_window`. A request exceeding this cap fails before the judge or
+answer model is called (HTTP 400 through the server), including when judge
+fail-open is enabled. The cap counts images across selected messages and nested
+tool results. Omit the field for no limit.
+
+The caller or media processor chooses which frames to supply. This setting does
+not sample, reorder, fetch, or resize images. Accepted images keep their original
+URLs/data and detail settings. With `0`, images become text markers without
+copying their payloads, so image-only messages remain valid. The answer request
+is unchanged. The cap applies when the judge runs; a retained route can skip it.
 
 Use `classify_trigger = "every_request"` for independent image requests. The
 optional message-hash affinity key uses only text, so identical questions about
 different images must not share that key. Escalation mode uses a text summary
 and rejects `judge_max_images`.
-
-The [Cosmos vision judge example](../../examples/vision_judge/README.md) includes
-both modes, a pinned VANTAGE still image, Cosmos/Astra answer targets, and a live
-runner that verifies the images sent to each model.
 
 ### Override the classifier prompt
 
@@ -296,48 +295,45 @@ enable `message_hash_fallback` to key on the first user-message text under
 
 ### Responses continuations by ID
 
-A Responses API client can continue without resending the conversation history:
-`previous_response_id` refers to a stored response, and `conversation` refers to
-a provider's conversation. When answer targets use different `[llm_clients]`
-entries, Switchyard records the model that served each stored Responses ID and
-conversation ID. A request with a recorded ID returns to that exact model
-without a judge call or fallback to another provider. This applies to every
-`classify_trigger` and to `stage_router` and `composite` routes. Classifier-only
-clients do not count; when answer targets share one client, routing proceeds as
-usual.
+A Responses API client can continue without resending the conversation history.
+Switchyard handles state differently depending on the target API:
 
-Switchyard tracks buffered and streamed Responses replies, including answers
-returned by `/v1/decision`. It does not record Chat Completions or Anthropic
-Messages response IDs as Responses continuation IDs. A provider's `store` value
-takes precedence over the request value. If that value is `false`, Switchyard
-skips the response ID but still records the conversation ID.
+- **Native Responses targets:** The provider stores the conversation. When answer
+  targets use different `[llm_clients]` entries, Switchyard records response and
+  conversation IDs with the model that served them, but no transcript. Classifier-only
+  clients do not count. When answer targets share one client, no local record is needed.
+  The provider's `store` value takes precedence over the request value. If it is
+  `false`, Switchyard skips the response ID but still records the conversation ID.
+- **Chat Completions or Anthropic Messages targets:** For incoming Responses
+  requests, Switchyard retains request and reply messages in memory under the
+  response ID. It restores that history on a later `previous_response_id` request.
+  This also applies when answer targets share one client. Request `store: false`
+  prevents retaining the new response and history, but does not delete earlier
+  records. This path supports `previous_response_id`, not provider conversation IDs.
+
+A request with a recorded ID returns to the model that served it without a judge
+call or fallback to another provider. This applies to every `classify_trigger`
+and to `stage_router` and `composite` routes. Tracking covers buffered replies and
+completed streams, including answers returned by `/v1/decision`. Ordinary Chat
+Completions and Anthropic Messages requests do not create Responses history.
 
 Each route keeps up to 65,536 distinct ID-to-model records per process. This
 limit counts response and conversation IDs recorded over the process's lifetime,
 not tokens or simultaneous requests. Records do not expire, and Switchyard does
-not remove older records to make room. The map stores copies of IDs and model
-names, with no transcript storage.
+not remove older records to make room. Cross-format records also retain message
+history, so this ID limit is not a memory limit. Memory use depends on the retained
+messages as well as the number of IDs.
 
-If recording new IDs would exceed the limit, a buffered reply returns HTTP 503
-with code `response_state_limit_exceeded`. If an ID is already recorded for a
-different model, it returns HTTP 409 with code `response_state_conflict`. Neither
-failure changes existing records. Switchyard checks both IDs before adding
-either from a response or stream event.
+At capacity, Switchyard logs a warning and returns the reply without retaining
+new IDs or history. Existing records remain usable, but a later continuation from
+an unrecorded ID may fail. Conflicting native Responses IDs return HTTP 409 with
+code `response_state_conflict`. If streaming headers have already been sent, the
+stream emits an error instead of changing the HTTP status.
 
-These checks run after the provider has returned a response or stream event, so
-the error does not mean the provider did no work. A stream that has already sent
-HTTP headers emits a framed error and stops; it cannot change the HTTP status.
-Switchyard logs these errors. For `/v1/responses`, buffered and streamed failures
-increment `/v1/stats` `total_errors`. Other routes continue independently.
-
-An existing ID can still be used at capacity if the reply adds no new IDs. For
-example, `store: false` can suppress a new response ID, but it does not suppress
-conversation-ID tracking. A stored follow-up normally creates a new response ID
-and therefore fails when the map is full.
-
-A restart removes all records, and each replica has its own map. Unknown IDs use
-normal routing and can still fail at the selected provider. To keep dynamic
-routing across turns, send the full history instead of an ID.
+A restart removes all local records and history, and each replica has its own
+state. Unknown IDs use normal routing and can still fail at the selected provider.
+Send the full history instead of an ID to avoid relying on local continuation
+state and to keep dynamic routing across turns.
 
 ## Run the route
 

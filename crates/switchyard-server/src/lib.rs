@@ -13,6 +13,8 @@ mod routing_log;
 mod shutdown;
 mod sse;
 mod stats;
+#[cfg(test)]
+mod testing;
 mod usage_metrics;
 
 use std::collections::BTreeMap;
@@ -72,6 +74,7 @@ const FORWARDED_UPSTREAM_HEADERS: &[&str] = &[
     "request-id",
     "traceparent",
     "tracestate",
+    "x-litellm-response-cost",
     "x-request-id",
 ];
 const FORWARDED_UPSTREAM_HEADER_PREFIXES: &[&str] =
@@ -444,7 +447,7 @@ fn stats_observer(
                 stats.record_error(&call.selected_model);
             }
         }
-        RunObservation::LlmCall(call) => {
+        RunObservation::LlmCall(call) | RunObservation::DecisionCall(call) => {
             let latency_ms = call.duration.as_secs_f64() * 1_000.0;
             if call.is_success {
                 if let (Some((log, context)), Some(usage)) =
@@ -1259,10 +1262,16 @@ fn sanitize_routing_header_value(value: &str) -> Option<String> {
 }
 
 fn algorithm_error(error: LibsyError) -> Response {
-    let LibsyError::ClientCall { source, .. } = &error else {
-        return server_error(error.to_string());
-    };
-    client_error(source)
+    match &error {
+        LibsyError::InvalidRequest { message } => error_response(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            "invalid_request_error",
+        ),
+        LibsyError::ClientCall { source, .. } => client_error(source),
+        _ => server_error(error.to_string()),
+    }
 }
 
 fn runner_error(error: RunnerError) -> Response {
@@ -1306,6 +1315,12 @@ fn client_error(error: &LlmClientError) -> Response {
             "invalid_request_error",
             "context_length_exceeded",
         ),
+        LlmClientError::TemporarilyUnavailable => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error.to_string(),
+            "upstream_error",
+            "temporarily_unavailable",
+        ),
         LlmClientError::UpstreamHttp { status, body } => upstream_error(*status, body),
         LlmClientError::Transport { source } | LlmClientError::InvalidResponse { source } => {
             error_response(
@@ -1341,7 +1356,12 @@ fn upstream_error(status: StatusCode, body: &str) -> Response {
         .as_str()
         .filter(|code| !code.is_empty())
         .unwrap_or("upstream_error");
-    error_response(status, message, "upstream_error", code)
+    let mut response = error_response(status, message, "upstream_error", code);
+    // Provider messages and codes can quote request content; log only fixed metadata.
+    response
+        .extensions_mut()
+        .insert(RequestLogError(format!("upstream_error (HTTP {status})")));
+    response
 }
 
 // Keep error details until the endpoint chooses its response format.
@@ -1394,11 +1414,16 @@ impl ApiError {
     }
 }
 
-fn render_error_response(response: Response, wire_format: WireFormat) -> Response {
-    let Some(error) = response.extensions().get::<ApiError>().cloned() else {
+fn render_error_response(mut response: Response, wire_format: WireFormat) -> Response {
+    let Some(error) = response.extensions_mut().remove::<ApiError>() else {
         return response;
     };
-    error.into_response(wire_format)
+    let log_error = response.extensions_mut().remove::<RequestLogError>();
+    let mut rendered = error.into_response(wire_format);
+    if let Some(log_error) = log_error {
+        rendered.extensions_mut().insert(log_error);
+    }
+    rendered
 }
 
 fn anthropic_error_response(response: Response) -> Response {
@@ -1555,11 +1580,12 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
         "created": 0,
         "owned_by": "switchyard",
         "display_name": model,
+        // OpenAI-compatible clients read the context window from this field.
+        "context_length": capabilities.context_window,
         "capabilities": {
             "streaming": true,
             "tool_calling": capabilities.tool_calling,
             "vision": capabilities.vision,
-            "context_window": capabilities.context_window,
             "supported_inbound_formats": [
                 "openai-chat-completions",
                 "openai-responses",
@@ -1667,7 +1693,7 @@ fn endpoint_listing(has_routing_log: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use switchyard_llm_client::LlmCallObservation;
+    use switchyard_llm_client::ModelCallObservation;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, oneshot};
 
@@ -1688,7 +1714,7 @@ mod tests {
         let observer = stats_observer(StatsAccumulator::default(), Some((log.clone(), context)));
 
         let call = |model: &str, answer: bool| {
-            let observation = LlmCallObservation {
+            let observation = ModelCallObservation {
                 selected_model: ModelId::from(model),
                 is_success: true,
                 duration: Duration::from_millis(3),
@@ -1902,9 +1928,7 @@ mod tests {
             let mut message = String::new();
             event.record(
                 &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
-                    if field.name() == "message" {
-                        message = format!("{value:?}");
-                    }
+                    message.push_str(&format!("{}={value:?} ", field.name()));
                 },
             );
             self.0.lock().push((*event.metadata().level(), message));
@@ -1927,7 +1951,7 @@ mod tests {
 
         let captured = CapturedEvents::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
-        tracing::subscriber::with_default(subscriber, run);
+        crate::testing::with_subscriber(subscriber, run);
         captured.0.lock().clone()
     }
 
@@ -1986,5 +2010,51 @@ mod tests {
                 .map(|error| error.0.as_str()),
             Some("invalid request")
         );
+    }
+
+    // The provider's message can quote request content, so the request log
+    // records only the error class while the client still sees the message.
+    #[test]
+    fn upstream_error_redacts_request_log_error() {
+        const LEAKED: &str = "SECRET-quoted-request-content";
+        let error = LlmClientError::UpstreamHttp {
+            status: StatusCode::BAD_GATEWAY,
+            body: format!(
+                r#"{{"error":{{"message":"validation failed: {LEAKED}","code":"invalid_request_{LEAKED}"}}}}"#
+            ),
+        };
+        for wire_format in [
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiResponses,
+            WireFormat::AnthropicMessages,
+        ] {
+            let response = render_error_response(client_error(&error), wire_format);
+            let events = captured_events(|| request_log_context().emit(&response));
+            assert_eq!(events.len(), 1);
+            assert!(!events[0].1.contains(LEAKED), "{}", events[0].1);
+            assert!(events[0].1.contains("upstream_error"), "{}", events[0].1);
+            let api_error = response
+                .extensions()
+                .get::<ApiError>()
+                .expect("ApiError extension");
+            assert!(api_error.message.contains(LEAKED), "{}", api_error.message);
+            assert_eq!(api_error.code, format!("invalid_request_{LEAKED}"));
+        }
+    }
+
+    // LiteLLM's cost header passes through to the client; auth headers do not.
+    #[test]
+    fn upstream_header_forwarding_covers_litellm_cost() {
+        for name in [
+            "baggage",
+            "x-litellm-response-cost",
+            "x-ratelimit-remaining",
+            "x-upstream-retry",
+        ] {
+            let header: HeaderName = name.parse().expect("header name");
+            assert!(should_forward_upstream_header(&header), "{name}");
+        }
+        let secret: HeaderName = "authorization".parse().expect("header name");
+        assert!(!should_forward_upstream_header(&secret));
     }
 }
