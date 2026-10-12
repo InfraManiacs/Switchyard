@@ -13,7 +13,7 @@ rust-version.workspace = true
 
 [dependencies]
 base64.workspace = true
-dynamo-multimodal = { git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "926d133af0702ea33a601da7e0ddc5d51235bff9", default-features = false }
+dynamo-multimodal = { version = "0.1.0", git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "926d133af0702ea33a601da7e0ddc5d51235bff9", default-features = false }
 futures-util.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 ipnet = "2"

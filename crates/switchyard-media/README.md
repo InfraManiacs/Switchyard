@@ -11,7 +11,8 @@ rotation, PNG output for transparency, URL fetching and FFmpeg frame extraction
 remain here. The client continues to use `MediaProcessor` and `MediaConfig`.
 Dynamo's optional Rayon pool is disabled; the existing bounded workers run decoding.
 Building from source requires CMake and a C/C++ toolchain for libjpeg-turbo.
-The Git dependency must be replaced with a published version before a crates.io release.
+Source builds use the pinned Git revision. Cargo packages use the compatible
+registry version `0.1.0`, which provides the same RGB resize API.
 
 Supported content: Chat `image_url` / `video_url`, Responses `input_image` /
 `input_video`, Anthropic image/video source blocks, and Gemini-on-Hub video
