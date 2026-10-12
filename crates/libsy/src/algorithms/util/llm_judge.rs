@@ -28,6 +28,10 @@ use switchyard_protocol::{LlmClientError, Request, Response};
 
 /// Builds the classifier-specific message view presented to a structured judge.
 pub(crate) trait ClassifierInput: Send + Sync {
+    fn validate_request(&self, _request: &Request) -> Result<()> {
+        Ok(())
+    }
+
     fn build_messages(&self, state: &State, request: &Request) -> Vec<Message>;
 }
 
@@ -155,6 +159,10 @@ where
 {
     type Verdict = D::Verdict;
 
+    fn validate_request(&self, request: &Request) -> Result<()> {
+        self.input.validate_request(request)
+    }
+
     fn build_request(&self, state: &State, request: &Request) -> Request {
         let messages = self.input.build_messages(state, request);
         Request {
@@ -169,6 +177,7 @@ where
                 output: OutputParams {
                     max_output_tokens: Some(self.runtime.max_output_tokens),
                     response_format: Some(self.contract.response_format().clone()),
+                    ..OutputParams::default()
                 },
                 ..LlmRequest::default()
             },
@@ -185,6 +194,11 @@ where
 /// Builds and parses requests for one algorithm-specific LLM judge.
 pub trait Judge: Send + Sync {
     type Verdict: DeserializeOwned + Send + Sync;
+
+    /// Reject invalid input before calling the judge or applying verdict fallback.
+    fn validate_request(&self, _request: &Request) -> Result<()> {
+        Ok(())
+    }
 
     fn build_request(&self, state: &State, request: &Request) -> Request;
 
@@ -216,6 +230,7 @@ where
 {
     judge: J,
     policy: P,
+    recover_errors: bool,
     evidence: Option<EvidenceFn<J::Verdict, P>>,
 }
 
@@ -229,8 +244,15 @@ where
         Self {
             judge,
             policy,
+            recover_errors: false,
             evidence: None,
         }
+    }
+
+    /// Lets the judge policy recover from client failures, including deadlines.
+    pub(crate) fn with_error_recovery(mut self, enabled: bool) -> Self {
+        self.recover_errors = enabled;
+        self
     }
 
     /// Enables bounded evidence for built-in judges without widening the public policy trait.
@@ -256,12 +278,10 @@ where
 
     /// Consults the judge, yielding `None` when it is unavailable or unintelligible.
     ///
-    /// A judge is an optimization, not a dependency: failing the caller's request because the
-    /// judge is down would be worse than routing without it, so every failure — transport,
-    /// mid-stream, or unparseable reply — is logged and folded into `None` for the policy's
-    /// fallback branch. A closed driver stream is folded too; the algorithm's next driver
-    /// call surfaces it, so nothing is masked.
-    async fn verdict(
+    /// Errors delivered by the host and invalid verdicts are logged and folded into `None`
+    /// for the policy's fallback branch. The HTTP driver delivers client errors here when
+    /// error recovery is enabled; otherwise it stops the run.
+    pub(crate) async fn verdict(
         &self,
         state: &mut State,
         request: &Request,
@@ -272,9 +292,10 @@ where
 
         tracing::info!(target = judge_model, "consulting llm judge");
         let response = driver
-            .call_model(
+            .call_model_with_error_recovery(
                 self.judge.build_request(state, request),
                 judge_models.to_vec(),
+                self.recover_errors,
             )
             .await
             .inspect_err(|error| {
@@ -302,7 +323,7 @@ where
 /// `error` must already be redacted: `LlmClientError::UpstreamHttp`'s `Display` interpolates the
 /// raw upstream body, which can quote the conversation back. Callers pass a
 /// `robustness::safe_*` summary rather than the error itself.
-fn report_fail_open(judge_model: &str, error: String, reason: &'static str) {
+pub(crate) fn report_fail_open(judge_model: &str, error: String, reason: &'static str) {
     tracing::warn!(
         target: "libsy",
         judge_model,
@@ -353,6 +374,7 @@ where
                 message: "no models available for category Judge".to_string(),
             });
         }
+        self.judge.validate_request(request)?;
         let verdict = self.verdict(state, request, driver, judge_models).await;
         let classification = self.policy.to_classification(verdict.as_ref(), driver)?;
         if let Some(evidence) = self

@@ -125,7 +125,7 @@ jobs:
       - name: Install media test runtime
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Media frame extraction tests
-        run: cargo test -p switchyard-llm-client --locked media:: -- --ignored
+        run: cargo test -p switchyard-media --locked -- --ignored
       - name: cargo test (prefill-router)
         run: cargo test -p switchyard-runner --features prefill-router --locked
 
@@ -157,7 +157,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12", "3.14"]
+        python-version: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -217,7 +217,7 @@ jobs:
       - name: Verify slim install (no extras) succeeds
         working-directory: /tmp
         run: |
-          uv run --isolated --no-project --python 3.10 \
+          uv run --isolated --no-project --python 3.12 \
             --with "${SWITCHYARD_DEFAULT_PACKAGE}" \
             python -c "import switchyard; from switchyard_rust.server import Server; print('import OK, version:', switchyard.__version__, 'server:', Server)"
           uv run --isolated --no-project --python 3.14 \
@@ -226,7 +226,7 @@ jobs:
       - name: Assert heavy packages absent from slim install
         working-directory: /tmp
         run: |
-          uv run --isolated --no-project --python 3.10 \
+          uv run --isolated --no-project --python 3.12 \
             --with "${SWITCHYARD_DEFAULT_PACKAGE}" \
             python - <<'PY'
           import importlib.util

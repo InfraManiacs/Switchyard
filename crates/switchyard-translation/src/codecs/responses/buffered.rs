@@ -9,12 +9,14 @@ use serde_json::{Map, Value, json};
 
 use crate::codecs::common::{
     collect_responses_reasoning_text, encrypted_reasoning_data, encrypted_reasoning_item_id,
-    is_known_role_name, provider_extensions, reasoning_text_from_blocks, text_from_blocks,
+    is_anthropic_request, is_known_role_name, provider_extensions, reasoning_text_from_blocks,
+    text_from_blocks,
 };
 use crate::codecs::openai_chat::{decode_file_source, decode_image_source};
 use crate::codecs::openai_media::{
     ImagePayload, file_payload, file_source_text, image_payload, image_source_text,
 };
+use crate::codecs::structured_output::{decode_openai_schema_enforcement, encode_openai_format};
 use crate::codecs::{
     DecodedRequest, DecodedResponse, EncodedRequest, EncodedResponse, FormatCodec,
 };
@@ -49,6 +51,7 @@ impl FormatCodec for OpenAiResponsesCodec {
         let sanitized = strip_codex_compaction_markers(body);
         let body = sanitized.as_ref().unwrap_or(body);
         let mut diagnostics = Vec::new();
+        let response_format = decode_responses_text_format(body.get("text"));
         let mut request = LlmRequest {
             model: body
                 .get("model")
@@ -57,7 +60,8 @@ impl FormatCodec for OpenAiResponsesCodec {
                 .map(ToOwned::to_owned),
             output: OutputParams {
                 max_output_tokens: body.get("max_output_tokens").and_then(Value::as_u64),
-                response_format: decode_responses_text_format(body.get("text")),
+                is_schema_enforced: decode_openai_schema_enforcement(response_format.as_ref()),
+                response_format,
             },
             reasoning: ReasoningParams {
                 effort: body
@@ -169,10 +173,10 @@ impl FormatCodec for OpenAiResponsesCodec {
     fn encode_request(
         &self,
         request: &LlmRequest,
-        _policy: &TranslationPolicy,
+        policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
         if let Some(body) =
-            exact_preserved_request(&request.preservation, WireFormat::OpenAiResponses, _policy)
+            exact_preserved_request(&request.preservation, WireFormat::OpenAiResponses, policy)
         {
             return Ok(EncodedRequest {
                 body,
@@ -180,7 +184,7 @@ impl FormatCodec for OpenAiResponsesCodec {
             });
         }
         let mut diagnostics = Vec::new();
-        validate_request_capabilities(request, &mut diagnostics, _policy)?;
+        validate_request_capabilities(request, &mut diagnostics, policy)?;
         let mut body = Map::new();
         if let Some(model) = &request.model {
             body.insert("model".to_string(), Value::String(model.clone()));
@@ -203,7 +207,7 @@ impl FormatCodec for OpenAiResponsesCodec {
             encode_responses_input(
                 &request.messages,
                 &mut diagnostics,
-                _policy,
+                policy,
                 crate::codex_namespaces::tool_namespaces(&request.extensions),
                 &crate::codex_custom_tools::custom_tool_names(&request.extensions),
                 crate::codex_custom_tools::custom_call_outputs(&request.extensions),
@@ -250,19 +254,38 @@ impl FormatCodec for OpenAiResponsesCodec {
         if let Some(max_output_tokens) = request.output.max_output_tokens {
             body.insert("max_output_tokens".to_string(), json!(max_output_tokens));
         }
-        if let Some(response_format) = &request.output.response_format {
+        if let Some(response_format) =
+            encode_openai_format(&request.output, &mut diagnostics, policy)?
+        {
             body.insert(
                 "text".to_string(),
-                json!({"format": encode_responses_text_format(response_format)}),
+                json!({"format": encode_responses_text_format(&response_format)}),
             );
         }
-        let mut reasoning = request
-            .reasoning
-            .raw
-            .as_ref()
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        // An Anthropic request's raw reasoning is its `thinking` object, which Responses
+        // does not accept. Keep only whether thinking is disabled.
+        let mut reasoning = if is_anthropic_request(request) {
+            let mut reasoning = Map::new();
+            if request
+                .reasoning
+                .raw
+                .as_ref()
+                .and_then(|thinking| thinking.get("type"))
+                .and_then(Value::as_str)
+                == Some("disabled")
+            {
+                reasoning.insert("effort".to_string(), json!("none"));
+            }
+            reasoning
+        } else {
+            request
+                .reasoning
+                .raw
+                .as_ref()
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default()
+        };
         if let Some(effort) = &request.reasoning.effort {
             reasoning.insert("effort".to_string(), json!(effort));
         }
@@ -280,7 +303,7 @@ impl FormatCodec for OpenAiResponsesCodec {
         }
         copy_responses_request_extensions(&mut body, &request.extensions.fields);
 
-        let body = embed_preservation(Value::Object(body), &request.preservation, _policy);
+        let body = embed_preservation(Value::Object(body), &request.preservation, policy);
         Ok(EncodedRequest { body, diagnostics })
     }
 
@@ -1006,6 +1029,7 @@ fn decode_responses_tools(
                 .get("name")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty());
+            let description = tool.get("description").and_then(Value::as_str);
             for mut child in decode_responses_tools(tool.get("tools"), namespaces, custom_tools) {
                 // A nested container already qualified its own children, and the
                 // innermost name is the one that identifies the tool.
@@ -1016,7 +1040,10 @@ fn decode_responses_tools(
                     let qualified =
                         crate::codex_namespaces::qualified_tool_name(container, &child.name);
                     crate::codex_namespaces::record_tool_namespace(
-                        namespaces, &qualified, container,
+                        namespaces,
+                        &qualified,
+                        container,
+                        description,
                     );
                     child.name = qualified;
                 }
@@ -1463,7 +1490,7 @@ fn encode_responses_special_input(
                 .and_then(|namespaces| {
                     crate::codex_namespaces::split_qualified_name(namespaces, &call.name)
                 })
-                .map_or((call.name.clone(), None), |(name, namespace)| {
+                .map_or((call.name.as_str(), None), |(name, namespace)| {
                     (name, Some(namespace))
                 });
             let mut item = json!({
@@ -1473,7 +1500,7 @@ fn encode_responses_special_input(
                 "arguments": json_string(&call.arguments),
             });
             if let Some(namespace) = namespace {
-                item["namespace"] = Value::String(namespace);
+                item["namespace"] = Value::String(namespace.to_string());
             }
             Some(item)
         }
@@ -1496,8 +1523,8 @@ fn encode_responses_special_input(
                     .and_then(|namespaces| {
                         crate::codex_namespaces::split_qualified_name(namespaces, name)
                     })
-                    .map_or_else(|| (*name).to_string(), |(name, _)| name);
-                item["name"] = Value::String(name);
+                    .map_or(*name, |(name, _)| name);
+                item["name"] = Value::String(name.to_string());
             }
             Some(item)
         }
@@ -1697,21 +1724,27 @@ fn encode_responses_tools(
         match split {
             None => out.push(item),
             Some((name, namespace)) => {
-                item["name"] = Value::String(name);
+                item["name"] = Value::String(name.to_string());
                 match containers
                     .iter_mut()
                     .find(|(existing, _)| *existing == namespace)
                 {
                     Some((_, children)) => children.push(item),
-                    None => containers.push((namespace, vec![item])),
+                    None => containers.push((namespace.to_string(), vec![item])),
                 }
             }
         }
     }
     for (namespace, children) in containers {
+        let description = namespaces
+            .and_then(|namespaces| {
+                crate::codex_namespaces::namespace_description(namespaces, &namespace)
+            })
+            .unwrap_or_default();
         out.push(json!({
             "type": "namespace",
             "name": namespace,
+            "description": description,
             "tools": children,
         }));
     }

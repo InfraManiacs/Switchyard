@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`TranslatingLlmClient`] — the crate's single public entry point: encode a neutral
+//! [`TranslatingLlmClient`]: encode a neutral
 //! request, call the configured backend over HTTP, decode the neutral response.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::ready;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -14,6 +15,7 @@ use http::StatusCode;
 use reqwest::RequestBuilder;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value, json};
+use switchyard_media::{MediaConfig, MediaError, MediaProcessor};
 use switchyard_protocol::{
     LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
     ModelId, Request, Response, RoutedLlmClient,
@@ -22,11 +24,11 @@ use switchyard_translation::{
     TranslationError, WireFormat, decode_aggregated_response, decode_request, decode_stream,
     encode_aggregated_response_with_extensions, encode_request, encode_stream_with_extensions,
 };
+use tokio::time::Instant;
 use tracing::Instrument;
 
 use crate::backend::{Backend, openai_url};
 use crate::error::{LlmClientError, Result};
-use crate::media::{MediaConfig, MediaError, MediaProcessor};
 use crate::metrics;
 use crate::raw::RawResponse;
 
@@ -136,17 +138,23 @@ pub struct TranslatingLlmClient {
     client: reqwest::Client,
     forward_auth_client: reqwest::Client,
     media_processor: Option<MediaProcessor>,
+    cooldown_epoch: Instant,
+    // Milliseconds since cooldown_epoch. Each atomic is independent, so relaxed ordering suffices.
+    unavailable_until: HashMap<ModelId, AtomicU64>,
 }
 
 impl TranslatingLlmClient {
     /// Builds a client over the given [`ModelConfig`]s, with a fresh shared HTTP
     /// client and the built-in translation codecs.
     pub fn new(model_configs: &[ModelConfig]) -> Result<Self> {
+        // Pre-populate so concurrent calls update only atomics and keep map access lock-free.
+        let mut unavailable_until = HashMap::new();
         for config in model_configs {
-            if let Some(media) = &config.media {
-                for backend in std::iter::once(&config.default_backend)
-                    .chain(config.other_backends.iter().flatten())
-                {
+            for backend in std::iter::once(&config.default_backend)
+                .chain(config.other_backends.iter().flatten())
+            {
+                backend.validate_configured_headers(&config.model_name)?;
+                if let Some(media) = &config.media {
                     media.validate(backend.wire_format()).map_err(|error| {
                         LlmClientError::Configuration {
                             message: error.to_string(),
@@ -154,12 +162,7 @@ impl TranslatingLlmClient {
                     })?;
                 }
             }
-            config
-                .default_backend
-                .validate_extra_headers(&config.model_name)?;
-            for backend in config.other_backends.iter().flatten() {
-                backend.validate_extra_headers(&config.model_name)?;
-            }
+            unavailable_until.insert(config.model_name.clone(), AtomicU64::new(0));
         }
         let build_client = |builder: reqwest::ClientBuilder| {
             builder.build().map_err(|error| LlmClientError::Transport {
@@ -189,6 +192,8 @@ impl TranslatingLlmClient {
             model_to_config,
             client,
             forward_auth_client,
+            cooldown_epoch: Instant::now(),
+            unavailable_until,
         })
     }
 
@@ -275,6 +280,20 @@ impl TranslatingLlmClient {
         model: &ModelId,
         endpoint: UpstreamEndpoint,
     ) -> Result<EncodedResponse> {
+        let cooldown = backend.failure_cooldown();
+        let unavailable_until =
+            if matches!(endpoint, UpstreamEndpoint::Completion) && !cooldown.is_zero() {
+                self.unavailable_until.get(model)
+            } else {
+                None
+            };
+        if let Some(until) = unavailable_until
+            && until.load(Ordering::Relaxed) > duration_millis(self.cooldown_epoch.elapsed())
+        {
+            tracing::debug!(model = %model, wire_format = %wire_format, "skipping backend during failure cooldown");
+            return Err(LlmClientError::TemporarilyUnavailable);
+        }
+
         let mut body = encode_request(&llm_request, wire_format)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
@@ -290,6 +309,7 @@ impl TranslatingLlmClient {
             strip_anthropic_incompatible_fields(&mut body);
             strip_unsigned_thinking_blocks(&mut body);
         }
+        omit_configured_body_fields(&mut body, backend.omit_body_fields());
         merge_extra_body(&mut body, backend.extra_body());
         // After the merge on purpose: the effort override must win over both the caller's
         // value and any `reasoning` default a target set through `extra_body`.
@@ -327,8 +347,21 @@ impl TranslatingLlmClient {
         let url = endpoint.url(backend);
         record_gen_ai_request(&url, model, streaming);
 
-        self.send_with_retries(&url, backend, &body, metadata, model, streaming)
-            .await
+        let result = self
+            .send_with_retries(&url, backend, &body, metadata, model, streaming)
+            .await;
+        // Forwarded credentials can hit a user's quota while the backend remains healthy.
+        if let Some(until) = unavailable_until
+            && let Err(error) = &result
+            && is_transient_failure(error)
+            && !(backend.is_forwarding_auth()
+                && matches!(error, LlmClientError::UpstreamHttp { status, .. } if *status == StatusCode::TOO_MANY_REQUESTS))
+        {
+            let deadline = duration_millis(self.cooldown_epoch.elapsed().saturating_add(cooldown));
+            until.fetch_max(deadline, Ordering::Relaxed);
+        }
+        // Let cooldown expire naturally; a successful in-flight call may overlap a newer failure.
+        result
     }
 
     // Sends the encoded body, retrying retryable failures within the backend's retry budget.
@@ -655,8 +688,9 @@ impl TranslatingLlmClient {
     /// `http_headers` are carried through as the request's
     /// [`Metadata::http_headers`]. Backends with `forward_auth` disabled forward only
     /// allowed metadata headers; `forward_auth` backends forward all application
-    /// headers. All backends reachable through a forwarding route must use the same
-    /// provider. Transport headers are always rebuilt. Pass `None` to forward nothing.
+    /// headers. The forwarding backends in one route must use one credential family
+    /// unless they all use the same scheme, host, and port. Transport headers are always
+    /// rebuilt. Pass `None` to forward nothing.
     pub async fn call_rewrite_model_raw(
         &self,
         raw_http_request: Value,
@@ -784,13 +818,17 @@ fn deadline_error(timeout: Duration) -> LlmClientError {
 
 impl AttemptFailure {
     fn is_retryable(&self) -> bool {
-        match &self.error {
-            LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => true,
-            LlmClientError::UpstreamHttp { status, .. } => {
-                metrics::is_retryable_http_status(status.as_u16())
-            }
-            _ => false,
+        is_transient_failure(&self.error)
+    }
+}
+
+fn is_transient_failure(error: &LlmClientError) -> bool {
+    match error {
+        LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => true,
+        LlmClientError::UpstreamHttp { status, .. } => {
+            metrics::is_retryable_http_status(status.as_u16())
         }
+        _ => false,
     }
 }
 
@@ -907,7 +945,7 @@ fn record_gen_ai_request(url: &str, model: &str, streaming: bool) {
     }
 }
 
-fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
+pub(crate) fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
     // Reqwest labels truncated or otherwise unreadable response bodies as decode
     // errors, so distinguish them from serde JSON failures at the call site.
     let error = error.without_url();
@@ -1197,6 +1235,15 @@ fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     }
 }
 
+fn omit_configured_body_fields(body: &mut Value, omit_body_fields: &BTreeSet<String>) {
+    let Value::Object(object) = body else {
+        return;
+    };
+    for key in omit_body_fields {
+        object.remove(key);
+    }
+}
+
 // Anthropic and Bedrock both cap a request at four blocks carrying
 // `cache_control`, counting tools, system blocks and message blocks together.
 const MAX_CACHE_CONTROL_BLOCKS: usize = 4;
@@ -1331,14 +1378,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread::JoinHandle;
 
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::json;
     use switchyard_protocol::{completion_text, text_request};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::VideoMode;
     use crate::backend::HttpBackendConfig;
 
     fn config(base_url: &str) -> HttpBackendConfig {
@@ -1348,8 +1393,10 @@ mod tests {
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
+            omit_body_fields: BTreeSet::new(),
             reasoning_effort: None,
             max_retries: 0,
+            failure_cooldown: Duration::ZERO,
             timeout: None,
         }
     }
@@ -1357,6 +1404,7 @@ mod tests {
     #[tokio::test]
     async fn target_media_prepares_preserved_body_without_mutating_answer_or_controls()
     -> std::result::Result<(), Box<dyn Error + Send + Sync>> {
+        use switchyard_media::VideoMode;
         let server = MockServer::start().await;
         Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id":"r", "object":"chat.completion", "model":"answer",
@@ -1416,67 +1464,6 @@ mod tests {
             assert_eq!(prepared["custom_control"], body["custom_control"]);
             assert_eq!(prepared["temperature"], body["temperature"]);
         }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn judge_resize_preserves_the_answer_image()
-    -> std::result::Result<(), Box<dyn Error + Send + Sync>> {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id":"r", "object":"chat.completion", "model":"answer",
-                "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]
-            })))
-            .expect(2)
-            .mount(&server)
-            .await;
-        let backend = Backend::OpenAiChat(config(&format!("{}/v1", server.uri())));
-        let client = TranslatingLlmClient::new(&[
-            ModelConfig::new("judge", backend.clone(), None).with_media(MediaConfig {
-                image_max_edge: Some(40),
-                ..Default::default()
-            }),
-            ModelConfig::new("answer", backend, None),
-        ])?;
-        let source = format!(
-            "data:image/jpeg;base64,{}",
-            STANDARD.encode(include_bytes!("media/fixtures/oriented.jpg"))
-        );
-        let body = json!({"model":"route", "messages":[{"role":"user","content":[
-            {"type":"text","text":"describe"},
-            {"type":"image_url","image_url":{"url":source,"detail":"high"}}
-        ]}]});
-        let request = Request {
-            llm_request: decode_request(WireFormat::OpenAiChat, &body)?,
-            ..Default::default()
-        };
-        for model in ["judge", "answer"] {
-            client
-                .call_rewrite_model(request.clone(), Some(&ModelId::from(model)))
-                .await?;
-        }
-        let received = server.received_requests().await.unwrap();
-        let judge: Value = serde_json::from_slice(&received[0].body)?;
-        let answer: Value = serde_json::from_slice(&received[1].body)?;
-        let image = &judge["messages"][0]["content"][1]["image_url"];
-        let encoded = image["url"]
-            .as_str()
-            .unwrap()
-            .strip_prefix("data:image/jpeg;base64,")
-            .unwrap();
-        let resized = image::load_from_memory(&STANDARD.decode(encoded)?)?;
-        assert_eq!((resized.width(), resized.height()), (20, 40));
-        assert_eq!(image["detail"], "high");
-        assert_eq!(
-            judge["messages"][0]["content"][0],
-            body["messages"][0]["content"][0]
-        );
-        assert_eq!(answer["messages"], body["messages"]);
-        assert_eq!(
-            encode_request(&request.llm_request, WireFormat::OpenAiChat)?,
-            body
-        );
         Ok(())
     }
 
@@ -1579,6 +1566,15 @@ mod tests {
     ) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         backend.extra_body = extra_body;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn chat_map_with_omit_body_fields(
+        base_url: &str,
+        omit_body_fields: BTreeSet<String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.omit_body_fields = omit_body_fields;
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
@@ -2234,6 +2230,50 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn omit_body_fields_strips_a_field_extra_body_cannot_override()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                body.get("max_tokens").is_none()
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_omit_body_fields(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["max_tokens".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 7
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
     // A weak OpenAI-format tier emits thinking blocks with no signature. Replaying
     // them to Anthropic is rejected (Bedrock reports it as a SigV4 mismatch), so
     // the Anthropic leg must drop them while keeping signed ones.
@@ -2512,6 +2552,51 @@ mod tests {
             } if body == "invalid key"
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rate_limit_cooldown_depends_on_shared_credentials()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        for forward_auth in [true, false] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+                .expect(if forward_auth { 6 } else { 3 })
+                .mount(&server)
+                .await;
+            let backend = HttpBackendConfig {
+                forward_auth,
+                failure_cooldown: Duration::from_secs(60),
+                ..config_with_retries(&format!("{}/v1", server.uri()), 2)
+            };
+            let client = TranslatingLlmClient::new(&[ModelConfig::new(
+                "gpt",
+                Backend::OpenAiChat(backend),
+                None,
+            )])?;
+            for credential in ["Bearer first-user", "Bearer second-user"] {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("authorization", http::HeaderValue::from_static(credential));
+                let result = client
+                    .call_rewrite_model(request_with_headers("gpt", headers), None)
+                    .await;
+                if !forward_auth && credential == "Bearer second-user" {
+                    assert!(matches!(
+                        result,
+                        Err(LlmClientError::TemporarilyUnavailable)
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(LlmClientError::UpstreamHttp {
+                            status: StatusCode::TOO_MANY_REQUESTS,
+                            ..
+                        })
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
