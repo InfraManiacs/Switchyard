@@ -75,15 +75,15 @@ pub async fn run(
         None => {
             drive(algorithm, request, models, {
                 let routing_observations = routing_observations.clone();
-        let route = route.clone();
-        move |call| {
-            serve(
-                routing_clients.clone(),
-                call,
-                routing_observations.clone(),
-                route.clone(),
-            )
-        }
+                let route = route.clone();
+                move |call| {
+                    serve(
+                        routing_clients.clone(),
+                        call,
+                        routing_observations.clone(),
+                        route.clone(),
+                    )
+                }
             })
             .await
         }
