@@ -6,7 +6,7 @@ name: Build and publish container image
 # Dockerfile is CPU-heavy, and QEMU-emulated arm64 compilation on an amd64
 # runner can run 5-10x+ slower than native. GitHub-hosted Linux ARM64 runners
 # (the `ubuntu-24.04-arm` label) are already used natively in this repo's own
-# publish.yml wheel matrix, which confirms they're available to this
+# publish.yml wheel matrix, which confirms they are available to this
 # org/repo. So each arch is built natively on its matching runner
 # (amd64 -> ubuntu-latest, arm64 -> ubuntu-24.04-arm) and the two resulting
 # single-arch images are combined into one multi-arch manifest list with
@@ -32,7 +32,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: lifestyle-aviation-systems/switchyard-server
+  IMAGE_NAME: inframaniacs/switchyard-server
 
 jobs:
   build:
