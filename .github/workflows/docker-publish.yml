@@ -141,10 +141,23 @@ jobs:
         working-directory: ${{ runner.temp }}/digests
         env:
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s " *)
+          # Every tag and every per-arch digest has to land as its own argv
+          # entry. The usual recipe gets that from an unquoted command
+          # substitution, which works but trips shellcheck SC2046 and silently
+          # mangles any value containing whitespace. Build real arrays instead.
+          tag_args=()
+          while IFS= read -r tag; do
+            tag_args+=(-t "$tag")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+
+          digest_args=()
+          for digest in *; do
+            digest_args+=("${IMAGE_REF}@sha256:${digest}")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${digest_args[@]}"
 
       - name: Inspect image
         run: |
