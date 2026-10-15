@@ -10,6 +10,8 @@ someone rebases forever.
 
 ## What it adds
 
+### Telemetry
+
 Upstream routes a call and reports token counts, but does not put the message
 content or the provider-reported cost onto the span. A platform whose thesis is
 that trace exhaust is the product needs both.
@@ -25,6 +27,30 @@ Four integration tests cover it: `gen_ai_content_capture.rs`, plus
 `client_call_span_records_provider_reported_cost`,
 `client_call_span_names_the_configured_target` and
 `streamed_usage_updates_the_client_call_span` in `tests/observability.rs`.
+
+### Configuration API
+
+Upstream reads its TOML file once at startup, so changing a route means
+editing a file and restarting the process. On this platform the file is a
+Kubernetes ConfigMap, which makes a one-line model swap a Helm change and a
+rollout.
+
+`crates/switchyard-server/src/config_api.rs` adds three endpoints behind an
+admin token — read the running document, replace it, and describe what each
+route resolves to. A replacement goes through `Runner::from_toml`, the same
+function the file loader calls, so the API accepts exactly what the file
+accepts and the two cannot drift apart. See
+[docs/reference/config_api.md](docs/reference/config_api.md).
+
+The API is absent unless `--admin-token` is set, which keeps the default
+behaviour identical to upstream's.
+
+`examples/config-admin/` runs the server, a stub upstream and the Switchyard
+Admin console under `docker compose`, with no API key and no model provider.
+
+![The Switchyard Admin console, showing two routes as rails branching into their targets, the running TOML document, and a request reporting which target answered.](docs/assets/switchyard-admin.png)
+
+Eight integration tests cover it in `crates/switchyard-server/tests/config_api.rs`.
 
 ## Rebasing onto a newer upstream
 
@@ -58,7 +84,16 @@ tag would sort *before* `v0.3.0` under semver prerelease rules and misrepresent
 the base. If upstream cuts a real `v0.3.1`, the next fork tag moves to
 `v0.3.2-otel.1`.
 
-Images publish to `ghcr.io/inframaniacs/switchyard-server`, multi-arch
-(linux/amd64 + linux/arm64). **Deploy an immutable tag, never `main`** — a
-floating tag can put two replicas on two different builds at once, which presents
-as intermittent telemetry loss rather than as a stale image.
+Two images publish on every tag, both multi-arch (linux/amd64 + linux/arm64):
+
+| Image | Built from |
+|---|---|
+| `ghcr.io/inframaniacs/switchyard-server` | the root `Dockerfile` |
+| `ghcr.io/inframaniacs/switchyard-admin-ui` | `examples/config-admin/ui` |
+
+They share a tag because the console drives the server's configuration API, and
+a shared tag keeps one version meaning the same build of both.
+
+**Deploy an immutable tag, never `main`** — a floating tag can put two replicas
+on two different builds at once, which presents as intermittent telemetry loss
+rather than as a stale image.
