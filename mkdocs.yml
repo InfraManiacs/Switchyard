@@ -44,6 +44,7 @@ nav:
       - Soak Testing: operations/soak_test.md
   - Reference:
       - Server CLI Reference: cli_reference.md
+      - Configuration API: reference/config_api.md
       - TOML Schema: reference/toml_schema.md
       - OpenTelemetry: reference/opentelemetry.md
       - Rust API: reference/rust_api.md
