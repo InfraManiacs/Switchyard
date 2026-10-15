@@ -1,0 +1,35 @@
+# Starting configuration for the local configuration-API stack.
+#
+# Edit it through the admin UI rather than here. The UI writes applied
+# documents back to this file, so a container restart keeps your changes.
+
+schema_version = 1
+
+[llm_clients.mock]
+format = "openai_chat"
+base_url = "http://mock-upstream:8000/v1"
+
+[targets.efficient]
+id = "mock-efficient"
+llm_client = "mock"
+system_prompt = "Answer briefly."
+
+[targets.capable]
+id = "mock-capable"
+llm_client = "mock"
+system_prompt = "Work through the request carefully."
+
+# The simplest route: one target, no decision to make.
+[routes.direct]
+id = "switchyard/direct"
+type = "passthrough"
+target = "efficient"
+
+# Two tiers, starting on the cheap one and escalating when confidence is low.
+[routes.tiered]
+id = "switchyard/tiered"
+type = "stage_router"
+capable_target = "capable"
+efficient_target = "efficient"
+picker = "efficient_first"
+confidence_threshold = 0.5

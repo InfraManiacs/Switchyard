@@ -19,7 +19,8 @@ pub(crate) async fn redact_response(
     next: Next,
 ) -> Response {
     let mut response = next.run(request).await;
-    let redactor = &state.redactor;
+    let config = state.config();
+    let redactor = &config.redactor;
     if redactor.is_empty() {
         return response;
     }
@@ -128,7 +129,7 @@ mod tests {
                     let mut response = crate::sse::frame_stream(
                         Box::pin(events),
                         WireFormat::OpenAiChat,
-                        Arc::clone(&state.redactor),
+                        Arc::clone(&state.config().redactor),
                     )
                     .into_response();
                     response.headers_mut().insert("x-upstream-debug", header);

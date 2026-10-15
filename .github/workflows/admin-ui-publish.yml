@@ -1,0 +1,84 @@
+name: Build and publish admin UI image
+
+# Builds examples/config-admin/ui into a multi-arch GHCR image, so a cluster can
+# run the Switchyard Admin console beside switchyard-server.
+#
+# Triggers match docker-publish.yml on purpose. The console drives the
+# configuration API, so the two images are only ever meaningful as a pair, and
+# a shared trigger keeps one tag meaning the same build of both.
+#
+# One job with QEMU, rather than the native-runner matrix docker-publish.yml
+# uses. That matrix exists because `cargo build --release` under emulation is
+# 5-10x slower than native. This image compiles nothing — it copies three files
+# onto an nginx base — so emulation costs seconds and the simpler workflow wins.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: inframaniacs/switchyard-admin-ui
+
+jobs:
+  build:
+    name: Build and push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Same tagging as docker-publish.yml: full semver on version tags,
+          # plus `:main` and a short-sha tag on the default branch. Note that
+          # metadata-action strips the leading `v`, so the git tag
+          # `v0.3.1-otel.3` publishes as the image tag `0.3.1-otel.3`.
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=main,enable={{is_default_branch}}
+            type=sha,enable={{is_default_branch}}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: examples/config-admin/ui
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"

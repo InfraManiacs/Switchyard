@@ -5,6 +5,7 @@
 
 mod capabilities;
 pub mod config;
+pub mod config_api;
 mod metrics;
 mod observability;
 mod redaction;
@@ -38,7 +39,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use libsy::{LibsyError, RoutingOutcome};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
@@ -158,11 +159,47 @@ struct DecisionLlmClientResponse {
     base_url: String,
 }
 
+/// The configuration a request is served with.
+///
+/// The runner and the redactor are replaced together. The redactor is built from
+/// the runner's provider keys, so replacing one without the other would let a key
+/// introduced by a new configuration reach logs and spans unredacted.
+pub(crate) struct ConfigSnapshot {
+    /// The TOML document this snapshot was built from.
+    source: String,
+    runner: Arc<Runner>,
+    redactor: Arc<redaction::Redactor>,
+    /// Counts applied configurations. Starts at 1 and increases by one on each
+    /// successful apply. Callers use it to detect a concurrent change.
+    version: u64,
+}
+
+impl ConfigSnapshot {
+    fn build(source: String, version: u64) -> Result<Self, RunnerError> {
+        let runner = Runner::from_toml(&source)?;
+        let redactor = redaction::Redactor::new(runner.provider_api_keys());
+        Ok(Self {
+            source,
+            runner: Arc::new(runner),
+            redactor: Arc::new(redactor),
+            version,
+        })
+    }
+
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+}
+
 /// Shared server state used by all endpoint handlers.
 #[derive(Clone)]
 pub struct ServerState {
-    runner: Arc<Runner>,
-    redactor: Arc<redaction::Redactor>,
+    config: Arc<RwLock<Arc<ConfigSnapshot>>>,
+    admin: Option<Arc<config_api::AdminAccess>>,
     fallback_http: reqwest::Client,
     metrics: prometheus::Registry,
     stats: StatsAccumulator,
@@ -206,7 +243,26 @@ impl SharedRoutingLog {
 
 impl ServerState {
     /// Creates HTTP-server state around an already configured runner.
+    ///
+    /// The configuration API needs the TOML the runner came from, which this
+    /// entry point does not have. State built here reports an empty document
+    /// until a configuration is applied through [`ServerState::from_toml`].
     pub fn from_runner(runner: Runner) -> ServerResult<Self> {
+        Self::from_parts(String::new(), runner)
+    }
+
+    /// Creates HTTP-server state from a TOML deployment document.
+    ///
+    /// Prefer this over [`ServerState::from_runner`] when the document is
+    /// available: it is what lets `GET /v1/config` return the running
+    /// configuration rather than an empty one.
+    pub fn from_toml(source: impl Into<String>) -> ServerResult<Self> {
+        let source = source.into();
+        let runner = Runner::from_toml(&source).map_err(ServerError::from)?;
+        Self::from_parts(source, runner)
+    }
+
+    fn from_parts(source: String, runner: Runner) -> ServerResult<Self> {
         let metrics = metrics::registry().map_err(ServerError::new)?;
         let fallback_http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -217,15 +273,47 @@ impl ServerState {
             runner.models().map(|model| model.algorithm),
         );
         let redactor = redaction::Redactor::new(runner.provider_api_keys());
-        Ok(Self {
-            redactor: Arc::new(redactor),
+        let snapshot = ConfigSnapshot {
+            source,
             runner: Arc::new(runner),
+            redactor: Arc::new(redactor),
+            version: 1,
+        };
+        Ok(Self {
+            config: Arc::new(RwLock::new(Arc::new(snapshot))),
+            admin: None,
             fallback_http,
             metrics,
             stats,
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
         })
+    }
+
+    /// Enables the configuration API under the supplied access policy.
+    pub fn with_admin_access(mut self, access: config_api::AdminAccess) -> Self {
+        self.admin = Some(Arc::new(access));
+        self
+    }
+
+    /// Returns the configuration in force now.
+    ///
+    /// A request resolves this once and keeps it for its whole lifetime, so an
+    /// applied configuration never takes effect halfway through a call already
+    /// in flight.
+    pub(crate) fn config(&self) -> Arc<ConfigSnapshot> {
+        self.config.read().clone()
+    }
+
+    /// Validates `source`, then replaces the running configuration with it.
+    ///
+    /// Nothing changes when the document does not build, so a rejected
+    /// configuration leaves the server serving the previous one.
+    pub(crate) fn apply_config(&self, source: String) -> Result<Arc<ConfigSnapshot>, RunnerError> {
+        let mut guard = self.config.write();
+        let snapshot = Arc::new(ConfigSnapshot::build(source, guard.version + 1)?);
+        *guard = snapshot.clone();
+        Ok(snapshot)
     }
 
     /// Enables durable per-request routing records at `path`.
@@ -235,20 +323,21 @@ impl ServerState {
     }
 
     /// Returns the route model IDs served by the configured algorithms.
-    pub fn models(&self) -> impl Iterator<Item = &str> {
-        self.runner.models().map(|model| model.id.as_str())
+    pub fn models(&self) -> Vec<String> {
+        self.config()
+            .runner
+            .models()
+            .map(|model| model.id.as_str().to_string())
+            .collect()
     }
 
     /// Returns the caller credential family used by `model`, if any.
     pub fn caller_auth_kind(&self, model: &str) -> Option<&'static str> {
-        self.runner
+        self.config()
+            .runner
             .route(model)
             .and_then(|route| route.caller_auth())
             .map(|kind| kind.as_str())
-    }
-
-    fn route_for_model(&self, model: &str) -> Option<&Route> {
-        self.runner.route(model)
     }
 
     fn decision_response(
@@ -257,7 +346,10 @@ impl ServerState {
         outcome: &RoutingOutcome,
         response: Option<Value>,
     ) -> Option<DecisionResponse> {
-        let description = self.runner.describe_decision(route_model, outcome)?;
+        let description = self
+            .config()
+            .runner
+            .describe_decision(route_model, outcome)?;
         let convert = |target: DecisionTarget| DecisionTargetResponse {
             target: target.target,
             model: target.model,
@@ -512,6 +604,15 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
     if state.routing_log.is_some() {
         router = router.route("/v1/routing/session-stats", get(get_session_stats));
     }
+    // Registered unconditionally so a request without a token gets 401 rather
+    // than the 404 of a path that does not exist. The handlers refuse every
+    // request when no admin token is configured.
+    router = router
+        .route(
+            "/v1/config",
+            get(config_api::get_config).put(config_api::put_config),
+        )
+        .route("/v1/config/routes", get(config_api::get_routes));
     finish_router(router.fallback(proxy_unmatched), state)
 }
 
@@ -582,7 +683,8 @@ async fn openai_responses(
 
 // Forwards unmatched requests unchanged to the configured API root.
 async fn proxy_unmatched(State(state): State<ServerState>, request: HttpRequest) -> Response {
-    let Some(base_url) = state.runner.fallback_base_url() else {
+    let config = state.config();
+    let Some(base_url) = config.runner.fallback_base_url() else {
         return not_found().await;
     };
     let (mut parts, body) = request.into_parts();
@@ -720,8 +822,9 @@ async fn decision(
         }
     };
     let input_format = body.input_format;
+    let config = state.config();
     let (route, request) = match resolve_route(
-        &state,
+        &config,
         metadata_from_headers(headers),
         body.request,
         input_format,
@@ -780,8 +883,9 @@ async fn anthropic_count_tokens(
             return anthropic_error_response(invalid_body_error(status, message));
         }
     };
+    let config = state.config();
     let (route, request) = match resolve_route(
-        &state,
+        &config,
         metadata_from_headers(headers),
         body,
         WireFormat::AnthropicMessages,
@@ -845,8 +949,9 @@ async fn openai_responses_auxiliary(
             );
         }
     };
+    let config = state.config();
     let (route, request) = match resolve_route(
-        &state,
+        &config,
         metadata_from_headers(headers),
         body,
         WireFormat::OpenAiResponses,
@@ -965,7 +1070,7 @@ fn llm_json_body(
 // the large error type is intentional, not propagated up a call stack.
 #[allow(clippy::type_complexity, clippy::result_large_err)]
 fn resolve_route(
-    state: &ServerState,
+    config: &ConfigSnapshot,
     metadata: Metadata,
     mut body: Value,
     wire_format: WireFormat,
@@ -989,7 +1094,7 @@ fn resolve_route(
                 "invalid_request_error",
             )
         })?;
-    let route = state.route_for_model(&requested_model).ok_or_else(|| {
+    let route = config.runner.route(&requested_model).ok_or_else(|| {
         error_response(
             StatusCode::NOT_FOUND,
             format!("No route registered for model {requested_model}"),
@@ -1043,7 +1148,8 @@ async fn handle_llm_request(
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
-    let (route, request) = match resolve_route(&state, metadata, body, wire_format) {
+    let config = state.config();
+    let (route, request) = match resolve_route(&config, metadata, body, wire_format) {
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
@@ -1093,7 +1199,7 @@ async fn handle_llm_request(
             started.0,
             state.stats,
             cache_eligible,
-            state.routing_log.zip(routing_log_context),
+            state.routing_log.clone().zip(routing_log_context),
         )
     } else {
         response
@@ -1106,7 +1212,7 @@ async fn handle_llm_request(
         wire_format,
         response_model,
         request_extensions,
-        Arc::clone(&state.redactor),
+        Arc::clone(&config.redactor),
     ) {
         Ok(response) => response,
         Err(error) => return server_error(error.to_string()),
@@ -1460,8 +1566,9 @@ fn error_response(
 }
 
 async fn models(State(state): State<ServerState>) -> Json<Value> {
+    let config = state.config();
     Json(model_list_payload(
-        state
+        config
             .runner
             .models()
             .map(|model| (model.id.as_str(), model.capabilities)),
@@ -1593,9 +1700,12 @@ fn startup_banner(options: &ServerRunOptions, state: &ServerState, color: bool) 
     let scheme = if options.is_tls() { "https" } else { "http" };
     let listen_url = url_for_addr(scheme, options.addr);
     let request_url = request_url_for_addr(scheme, options.addr);
-    let routes = state.models().collect::<Vec<_>>();
+    let routes = state.models();
     let route_list = routes.join(", ");
-    let example_model = routes.first().copied().unwrap_or("switchyard/route");
+    let example_model = routes
+        .first()
+        .map(String::as_str)
+        .unwrap_or("switchyard/route");
     let example_body = json!({
         "model": example_model,
         "messages": [{"role": "user", "content": "Hello from Switchyard"}],
@@ -1607,7 +1717,7 @@ fn startup_banner(options: &ServerRunOptions, state: &ServerState, color: bool) 
         render_startup_banner_art(color),
         listen_url,
         route_list,
-        endpoint_listing(state.routing_log.is_some()),
+        endpoint_listing(state.routing_log.is_some(), state.admin.is_some()),
         example_url,
         example_body,
     )
@@ -1629,10 +1739,7 @@ fn render_startup_banner_art(color: bool) -> String {
 }
 
 fn dry_run_summary(state: &ServerState) -> String {
-    format!(
-        "server OK: {}",
-        state.models().collect::<Vec<_>>().join(", ")
-    )
+    format!("server OK: {}", state.models().join(", "))
 }
 
 fn url_for_addr(scheme: &'static str, addr: SocketAddr) -> String {
@@ -1664,7 +1771,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn endpoint_listing(has_routing_log: bool) -> String {
+fn endpoint_listing(has_routing_log: bool, has_admin_access: bool) -> String {
     let mut endpoints = vec![
         "  POST /v1/chat/completions    OpenAI Chat Completions",
         "  POST /v1/messages            Anthropic Messages",
@@ -1681,6 +1788,11 @@ fn endpoint_listing(has_routing_log: bool) -> String {
     ];
     if has_routing_log {
         endpoints.push("  GET  /v1/routing/session-stats");
+    }
+    if has_admin_access {
+        endpoints.push("  GET  /v1/config              running configuration");
+        endpoints.push("  PUT  /v1/config              replace the configuration");
+        endpoints.push("  GET  /v1/config/routes       what each route resolves to");
     }
     endpoints.join("\n")
 }

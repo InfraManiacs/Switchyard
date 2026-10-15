@@ -42,6 +42,7 @@ switchyard-protocol.workspace = true
 switchyard-runner.workspace = true
 serde_json.workspace = true
 switchyard-translation.workspace = true
+toml = "1.1"
 humantime = "2.4"
 tokio.workspace = true
 tracing.workspace = true
