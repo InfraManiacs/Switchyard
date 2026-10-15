@@ -1,0 +1,30 @@
+# Serves the Switchyard Admin console and forwards the API to switchyard-server.
+#
+# One origin for both means the console needs no CORS handling, and the server
+# needs no browser-specific code.
+#
+# `SWITCHYARD_UPSTREAM` is substituted at container start by nginx's own
+# template mechanism. NGINX_ENVSUBST_FILTER (set in the Dockerfile) limits that
+# substitution to SWITCHYARD_* names, so nginx's own `$host` and `$remote_addr`
+# style variables are left alone.
+
+server {
+    listen 8080;
+
+    location / {
+        root /usr/share/nginx/html;
+        index index.html;
+        # The console is one small page. Serving it fresh keeps a browser from
+        # holding a build older than the server it is driving.
+        add_header Cache-Control "no-store";
+    }
+
+    location /v1/ {
+        proxy_pass ${SWITCHYARD_UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        # Routed requests can take minutes, and the console sends one to test a
+        # route.
+        proxy_read_timeout 600s;
+    }
+}

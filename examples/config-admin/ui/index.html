@@ -1,0 +1,523 @@
+<!doctype html>
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+A page for driving the configuration API by hand. One file, no build step, no
+framework, so it stays easy to read and change while the API does.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Switchyard Admin</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        /* NVIDIA green is the only accent. It marks the brand rail, the
+           primary action, and anything currently serving traffic. It is never
+           used as decoration. */
+        --green: #76b900;
+        --green-deep: #5a8f00;
+        --green-glow: rgba(118, 185, 0, 0.14);
+
+        --black: #000000;
+        --surface: #0d0d0d;
+        --surface-high: #141414;
+        --line: #262626;
+        --line-bright: #3a3a3a;
+
+        --text: #f2f2f2;
+        --muted: #8a8a8a;
+        --amber: #ffb500;
+        --red: #ff4b4b;
+
+        --sans: "Archivo", "Helvetica Neue", Arial, sans-serif;
+        --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        background: var(--black);
+      }
+
+      body {
+        margin: 0;
+        color: var(--text);
+        font-family: var(--sans);
+        font-size: 14px;
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      /* ---- Masthead ------------------------------------------------- */
+
+      .masthead {
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        flex-wrap: wrap;
+        padding: 18px 28px;
+        border-bottom: 1px solid var(--line);
+        background: var(--surface);
+      }
+
+      .wordmark {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0;
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      /* The brand rail. A switchyard is where things get sorted onto tracks,
+         and that rail is repeated at every branch point on the page. */
+      .wordmark::before {
+        content: "";
+        width: 4px;
+        height: 22px;
+        background: var(--green);
+      }
+
+      .wordmark span {
+        font-weight: 400;
+        color: var(--muted);
+        letter-spacing: 0.14em;
+      }
+
+      .state {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .state b {
+        color: var(--text);
+        font-weight: 500;
+      }
+
+      .state.live b {
+        color: var(--green);
+      }
+
+      .spacer {
+        flex: 1 1 120px;
+      }
+
+      .credential {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      label {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      input {
+        background: var(--black);
+        color: var(--text);
+        border: 1px solid var(--line-bright);
+        border-radius: 2px;
+        padding: 7px 10px;
+        font-family: var(--mono);
+        font-size: 12px;
+        min-width: 210px;
+      }
+
+      input::placeholder {
+        color: #5c5c5c;
+      }
+
+      input:focus-visible,
+      textarea:focus-visible,
+      button:focus-visible {
+        outline: 2px solid var(--green);
+        outline-offset: 2px;
+      }
+
+      /* ---- Layout ---------------------------------------------------- */
+
+      main {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 1px;
+        background: var(--line);
+        min-height: calc(100vh - 61px);
+      }
+
+      @media (max-width: 1000px) {
+        main {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+
+      .panel {
+        display: flex;
+        flex-direction: column;
+        background: var(--black);
+        padding: 24px 28px 32px;
+        min-width: 0;
+      }
+
+      .panel-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        margin-bottom: 4px;
+      }
+
+      h2 {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+
+      .lede {
+        margin: 0 0 22px;
+        color: var(--muted);
+        font-size: 13px;
+        max-width: 62ch;
+      }
+
+      /* ---- Routes: the rail diagram ---------------------------------- */
+
+      .route {
+        border-top: 1px solid var(--line);
+        padding: 18px 0 20px;
+      }
+
+      .route:last-child {
+        border-bottom: 1px solid var(--line);
+      }
+
+      .route-head {
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .route-id {
+        font-family: var(--mono);
+        font-size: 14px;
+        font-weight: 500;
+        color: var(--text);
+      }
+
+      .route-name {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .algorithm {
+        margin-left: auto;
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--muted);
+        border: 1px solid var(--line-bright);
+        border-radius: 2px;
+        padding: 2px 7px;
+      }
+
+      /* Each target hangs off a rail running down from the route. */
+      .targets {
+        margin: 14px 0 0;
+        padding: 0 0 0 18px;
+        list-style: none;
+        border-left: 2px solid var(--line-bright);
+      }
+
+      .route.applied .targets {
+        animation: rail-pulse 1.1s ease-out 1;
+      }
+
+      @keyframes rail-pulse {
+        0% {
+          border-left-color: var(--green);
+          box-shadow: -2px 0 12px var(--green-glow);
+        }
+        100% {
+          border-left-color: var(--line-bright);
+          box-shadow: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .route.applied .targets {
+          animation: none;
+        }
+      }
+
+      .target {
+        position: relative;
+        padding: 0 0 14px 18px;
+      }
+
+      .target:last-child {
+        padding-bottom: 0;
+      }
+
+      /* The branch connector: where this target leaves the rail. */
+      .target::before {
+        content: "";
+        position: absolute;
+        left: -2px;
+        top: 9px;
+        width: 14px;
+        height: 2px;
+        background: var(--line-bright);
+      }
+
+      .target.serving::before {
+        background: var(--green);
+      }
+
+      .target-line {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .target-name {
+        font-size: 13px;
+        color: var(--text);
+      }
+
+      .target-model {
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--green);
+      }
+
+      .target-client {
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .prompt {
+        margin: 4px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.55;
+        max-width: 60ch;
+      }
+
+      .empty {
+        border: 1px dashed var(--line-bright);
+        padding: 20px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      /* ---- Configuration editor -------------------------------------- */
+
+      textarea {
+        display: block;
+        width: 100%;
+        /* Grows to fill the column so the editor does not end in a void when
+           the window is tall. The minimum keeps it usable when it is not. */
+        flex: 1 1 auto;
+        min-height: 46vh;
+        resize: vertical;
+        background: var(--surface);
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 2px;
+        padding: 14px 16px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+        line-height: 1.7;
+        tab-size: 2;
+      }
+
+      textarea:focus-visible {
+        border-color: var(--line-bright);
+      }
+
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 16px;
+      }
+
+      button {
+        font-family: var(--sans);
+        font-size: 13px;
+        font-weight: 600;
+        border: 1px solid transparent;
+        border-radius: 2px;
+        padding: 9px 18px;
+        cursor: pointer;
+        background: var(--green);
+        color: var(--black);
+        transition: background 120ms ease;
+      }
+
+      button:hover:not(:disabled) {
+        background: var(--green-deep);
+      }
+
+      button.quiet {
+        background: transparent;
+        color: var(--text);
+        border-color: var(--line-bright);
+        font-weight: 500;
+      }
+
+      button.quiet:hover:not(:disabled) {
+        background: var(--surface-high);
+      }
+
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      .edited {
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--amber);
+      }
+
+      .message {
+        margin-top: 16px;
+        padding-left: 14px;
+        border-left: 2px solid var(--line-bright);
+        font-family: var(--mono);
+        font-size: 12px;
+        line-height: 1.65;
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: var(--muted);
+      }
+
+      .message:empty {
+        display: none;
+      }
+
+      .message.ok {
+        border-left-color: var(--green);
+        color: var(--text);
+      }
+
+      .message.warn {
+        border-left-color: var(--amber);
+        color: var(--text);
+      }
+
+      .message.bad {
+        border-left-color: var(--red);
+        color: var(--text);
+      }
+
+      /* ---- Probe ------------------------------------------------------ */
+
+      /* The probe is a footer tool. Pushing it down keeps the column from
+         ending in a void when there are few routes. */
+      .probe {
+        margin-top: auto;
+        padding-top: 22px;
+        border-top: 1px solid var(--line);
+      }
+
+      @media (max-width: 1000px) {
+        .probe {
+          margin-top: 34px;
+        }
+      }
+
+      .probe .controls {
+        margin-top: 12px;
+      }
+
+      .probe input {
+        flex: 1 1 260px;
+        min-width: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="masthead">
+      <h1 class="wordmark">Switchyard <span>Admin</span></h1>
+      <p class="state" id="state">Not loaded</p>
+      <span class="spacer"></span>
+      <div class="credential">
+        <label for="token">Admin token</label>
+        <input id="token" type="password" placeholder="Paste the admin token" autocomplete="off" />
+        <button class="quiet" id="load">Load</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="panel">
+        <div class="panel-head"><h2>Routes</h2></div>
+        <p class="lede">
+          Every route a client can request, and the targets it can switch a
+          request onto.
+        </p>
+        <div id="routes">
+          <div class="empty">Load the configuration to see the routes.</div>
+        </div>
+
+        <div class="probe">
+          <div class="panel-head"><h2>Send a request</h2></div>
+          <p class="lede">
+            Check which target answers. The reply names the model that served it.
+          </p>
+          <div class="controls">
+            <input id="probe-model" type="text" placeholder="switchyard/direct" />
+            <button class="quiet" id="send">Send request</button>
+          </div>
+          <p class="message" id="probe-message"></p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Deployment document</h2>
+          <span class="edited" id="edited"></span>
+        </div>
+        <p class="lede">
+          The server validates this before it serves it. A document that does not
+          build is refused and the running one keeps serving.
+        </p>
+        <textarea
+          id="source"
+          spellcheck="false"
+          placeholder="Load the configuration to begin."
+          aria-label="Deployment document"
+        ></textarea>
+        <div class="controls">
+          <button id="apply">Apply changes</button>
+          <button class="quiet" id="discard">Discard edits</button>
+        </div>
+        <p class="message" id="message"></p>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
