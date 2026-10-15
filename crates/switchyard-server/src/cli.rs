@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use switchyard_server::config::load_server_state;
+use switchyard_server::config_api::AdminAccess;
 use switchyard_server::{
     DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT, DEFAULT_LISTEN_BACKLOG, ServerError, ServerResult,
     ServerRunOptions, ServerState, TlsOptions, run_server,
@@ -52,6 +53,20 @@ pub(crate) struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     routing_log_file: Option<PathBuf>,
 
+    /// Bearer token that enables the configuration API.
+    ///
+    /// The API replaces model routing for every caller of this server, so it
+    /// stays disabled until a token is set.
+    #[arg(long, value_name = "TOKEN", env = "SWITCHYARD_ADMIN_TOKEN")]
+    admin_token: Option<String>,
+
+    /// Write an applied configuration back to the --config file.
+    ///
+    /// Without this an applied configuration lives only in memory, and the
+    /// server returns to the file on restart.
+    #[arg(long, requires = "admin_token")]
+    admin_persist: bool,
+
     /// TLS certificate path in PEM format.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -71,6 +86,13 @@ impl ServerArgs {
         let mut state = load_server_state(&self.config)?;
         if let Some(path) = self.routing_log_file {
             state = state.with_routing_log(path)?;
+        }
+        if let Some(token) = self.admin_token {
+            let mut access = AdminAccess::new(token);
+            if self.admin_persist {
+                access = access.persisting_to(&self.config);
+            }
+            state = state.with_admin_access(access);
         }
         let tls = match (self.tls_cert, self.tls_key) {
             (Some(cert), Some(key)) => {
